@@ -6,6 +6,7 @@
 
 extern void rowop_ap(void *dst);
 extern void rowop_aap(void *dst, void *src);
+extern void rowop_copy(void *dst, void *src);
 
 #define ROW_SIZE 8192
 #define BANK_COUNT 16
@@ -13,11 +14,16 @@ extern void rowop_aap(void *dst, void *src);
 #define ROWS_PER_VECTOR (BANK_COUNT * RANK_COUNT)
 #define ALIGNMENT (ROW_SIZE * ROWS_PER_VECTOR)
 
+/* Must match gem5's rows_per_subarray parameter */
+#define ROWS_PER_SUBARRAY 512
+#define SUBARRAY_SIZE ((size_t)ROWS_PER_SUBARRAY * ALIGNMENT)
+
 #define FOR_ALL_VECTORS for(int base_row = 0; base_row < per_col_rows; base_row += ROWS_PER_VECTOR)
 #define VECTOR(ptr) ((void *)(ptr) + base_row*ROW_SIZE)
 #define FOR_ALL_ROWS_IN_VECTOR for(int row = 0; row < per_col_rows - base_row && row < ROWS_PER_VECTOR; row ++)
 #define ROW(ptr) ((void *)(ptr) + row*ROW_SIZE)
 #define AAP_VECTORS(dst, src) FOR_ALL_ROWS_IN_VECTOR { rowop_aap(ROW(dst), ROW(src));}
+#define COPY_VECTORS(dst, src) FOR_ALL_ROWS_IN_VECTOR { rowop_copy(ROW(dst), ROW(src));}
 #define AP_VECTOR(dst)        FOR_ALL_ROWS_IN_VECTOR { rowop_ap (ROW(dst));}
 
 static void *B_T0         = NULL;

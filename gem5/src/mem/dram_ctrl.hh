@@ -462,6 +462,8 @@ class DRAMCtrl : public AbstractMemory
         /** Used for row ops */
         uint32_t src1_row;
         uint32_t src2_row;
+        uint8_t  src_rank;  // Source rank for ROWCOPY (may differ from dst rank)
+        uint8_t  src_bank;  // Source bank for ROWCOPY (may differ from dst bank)
         bool is_row_op;
         Request::RowOp row_op;
 
@@ -499,7 +501,8 @@ class DRAMCtrl : public AbstractMemory
                    unsigned int _size, Bank& bank_ref, Rank& rank_ref)
             : entryTime(curTick()), readyTime(curTick()),
               pkt(_pkt), isRead(is_read), rank(_rank), bank(_bank), row(_row),
-              src1_row(0), src2_row(0), is_row_op(false), bankId(bank_id),
+              src1_row(0), src2_row(0), src_rank(0), src_bank(0),
+              is_row_op(false), bankId(bank_id),
               addr(_addr), size(_size), burstHelper(NULL), bankRef(bank_ref),
               rankRef(rank_ref)
         { }
@@ -749,6 +752,7 @@ class DRAMCtrl : public AbstractMemory
     const uint32_t banksPerRank;
     const uint32_t channels;
     uint32_t rowsPerBank;
+    const uint32_t rowsPerSubarray;
     const uint32_t readBufferSize;
     const uint32_t writeBufferSize;
     const uint32_t writeHighThreshold;

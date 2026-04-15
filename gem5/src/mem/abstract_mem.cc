@@ -362,6 +362,11 @@ AbstractMemory::access(PacketPtr pkt)
                     *dest++ = *src1++ ^ *src2++;
                 }
                 break;
+            case Request::ROWCOPY:
+				for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t)) {
+                    *dest++ = *src1++;
+                }
+				break;
 			case Request::ROWAP:
 				//TODO implement
 				break;

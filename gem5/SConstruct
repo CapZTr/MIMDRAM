@@ -225,6 +225,7 @@ for key,val in sorted(os.environ.iteritems()):
 # with the param wrappes being compiled twice (see
 # http://scons.tigris.org/issues/show_bug.cgi?id=2811)
 main = Environment(ENV=use_env, IMPLICIT_COMMAND_DEPENDENCIES=0)
+main.Append(CCFLAGS=['-DPROTOBUF_INLINE_NOT_IN_HEADERS=0'])
 main.Decider('MD5-timestamp')
 main.root = Dir(".")         # The current directory (where this file lives).
 main.srcdir = Dir("src")     # The source directory

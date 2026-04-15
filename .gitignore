@@ -1,0 +1,7 @@
+*.exe
+*.ll
+*.o
+*.pyc
+*parsetab.py
+*/build/
+*/m5out/

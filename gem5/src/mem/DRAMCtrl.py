@@ -126,6 +126,7 @@ class DRAMCtrl(AbstractMemory):
     # update per memory class when bank group architecture is supported
     bank_groups_per_rank = Param.Unsigned(0, "Number of bank groups per rank")
     banks_per_rank = Param.Unsigned("Number of banks per rank")
+    rows_per_subarray = Param.Unsigned(512, "Number of rows per subarray")
     # only used for the address mapping as the controller by
     # construction is a single channel and multiple controllers have
     # to be instantiated for a multi-channel configuration

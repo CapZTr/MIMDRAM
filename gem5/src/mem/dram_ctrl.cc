@@ -74,6 +74,7 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     bankGroupsPerRank(p->bank_groups_per_rank),
     bankGroupArch(p->bank_groups_per_rank > 0),
     banksPerRank(p->banks_per_rank), channels(p->channels), rowsPerBank(0),
+    rowsPerSubarray(p->rows_per_subarray),
     readBufferSize(p->read_buffer_size),
     writeBufferSize(p->write_buffer_size),
     writeHighThreshold(writeBufferSize * p->write_high_thresh_perc / 100.0),
@@ -155,6 +156,10 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
             rowBufferSize, columnsPerRowBuffer);
 
     rowsPerBank = capacity / (rowBufferSize * banksPerRank * ranksPerChannel);
+
+    if (rowsPerBank % rowsPerSubarray != 0)
+        fatal("rowsPerBank (%d) must be a multiple of rowsPerSubarray (%d)\n",
+              rowsPerBank, rowsPerSubarray);
 
     // some basic sanity checks
     if (tREFI <= tRP || tREFI <= tRFC) {
@@ -523,18 +528,26 @@ DRAMCtrl::addToWriteQueue(PacketPtr pkt, unsigned int pktCount)
         dram_pkt->is_row_op = true;
         dram_pkt->row_op = addrs->op;
 
-		// Only care about dram_pkt1 if the operation is not in place
-        if (addrs->op != Request::ROWAP) {
-        	assert(dram_pkt->rank == dram_pkt1->rank);
-        	assert(dram_pkt->bank == dram_pkt1->bank);
-		}
-        // Only care about dram_pkt2 if it's a binary op
-        if (addrs->op != Request::ROWNOT && addrs->op != Request::ROWAAP && addrs->op != Request::ROWAP) {
-          assert(dram_pkt->rank == dram_pkt2->rank);
-          assert(dram_pkt->bank == dram_pkt2->bank);
+        // ROWCOPY allows src and dst to reside in different banks/ranks
+        if (addrs->op == Request::ROWCOPY) {
+            dram_pkt->src_rank = dram_pkt1->rank;
+            dram_pkt->src_bank = dram_pkt1->bank;
+            dram_pkt->src1_row = dram_pkt1->row;
+        } else {
+            // All other ops are strictly intra-bank
+            if (addrs->op != Request::ROWAP) {
+                assert(dram_pkt->rank == dram_pkt1->rank);
+                assert(dram_pkt->bank == dram_pkt1->bank);
+                assert(dram_pkt->row / rowsPerSubarray == dram_pkt1->row / rowsPerSubarray);
+            }
+            if (addrs->op != Request::ROWNOT && addrs->op != Request::ROWAAP && addrs->op != Request::ROWAP) {
+                assert(dram_pkt->rank == dram_pkt2->rank);
+                assert(dram_pkt->bank == dram_pkt2->bank);
+                assert(dram_pkt->row / rowsPerSubarray == dram_pkt2->row / rowsPerSubarray);
+            }
+            dram_pkt->src1_row = dram_pkt1->row;
+            dram_pkt->src2_row = dram_pkt2->row;
         }
-        dram_pkt->src1_row = dram_pkt1->row;
-        dram_pkt->src2_row = dram_pkt2->row;
         delete dram_pkt1;
         delete dram_pkt2;
 
@@ -1196,11 +1209,79 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 aapBank(rank, bank, cmd_at, Bank::B_T0_T1_T2,   dram_pkt->row,    true); cmd_at = bank.actAllowedAt;
                 break;
             case Request::ROWAP:
-		apBank (rank, bank, cmd_at, Bank::B_T0_T1_T2); cmd_at = bank.actAllowedAt;		//TODO replace Bank::B_T0_T1_T2 with correct bank
-		break;
+                apBank (rank, bank, cmd_at, Bank::B_T0_T1_T2); cmd_at = bank.actAllowedAt;		//TODO replace Bank::B_T0_T1_T2 with correct bank
+		        break;
 	    case Request::ROWAAP:
 		aapBank(rank, bank, cmd_at, 0, 0, true); cmd_at = bank.actAllowedAt;	//TODO replace NULLs with correct banks
 		break;
+            case Request::ROWCOPY: {
+                bool same_subarray =
+                    dram_pkt->src_rank == dram_pkt->rank &&
+                    dram_pkt->src_bank == dram_pkt->bank &&
+                    dram_pkt->src1_row / rowsPerSubarray == dram_pkt->row / rowsPerSubarray;
+
+                if (same_subarray) {
+                    // Intra-subarray copy: src and dst share sense amplifiers,
+                    // so a single AAP (ACT src + ACT dst + PRE) suffices.
+                    if (bank.openRow != Bank::NO_ROW)
+                        prechargeBank(rank, bank,
+                                      std::max(bank.preAllowedAt, curTick()));
+                    cmd_at = std::max(cmd_at, bank.actAllowedAt);
+                    aapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row, true);
+                    cmd_at = bank.actAllowedAt;
+                    DPRINTF(DRAM, "ROWCOPY (intra-subarray) rank%d/bank%d/row%d -> row%d\n",
+                            dram_pkt->rank, dram_pkt->bank,
+                            dram_pkt->src1_row, dram_pkt->row);
+                } else {
+                    // Inter-bank row copy via bus:
+                    //   ACT src_row; ACT dst_row;
+                    //   RD all columns of src  → data travels over the bus;
+                    //   WR all columns of dst  ← data from bus;
+                    //   PRE src; PRE dst.
+                    Rank& src_rank_ref = *ranks[dram_pkt->src_rank];
+                    Bank& src_bank_ref = src_rank_ref.banks[dram_pkt->src_bank];
+
+                    // Precharge source bank if it has an open page.
+                    // Dest bank was already precharged by the top-level row-op code.
+                    if (src_bank_ref.openRow != Bank::NO_ROW)
+                        prechargeBank(src_rank_ref, src_bank_ref,
+                                      std::max(src_bank_ref.preAllowedAt, curTick()));
+
+                    // ACT src row (cmd_at already accounts for dst bank's actAllowedAt)
+                    Tick src_act_at = std::max(cmd_at, src_bank_ref.actAllowedAt);
+                    activateBank(src_rank_ref, src_bank_ref, src_act_at, dram_pkt->src1_row);
+
+                    // ACT dst row (tRRD propagated into bank.actAllowedAt by activateBank)
+                    Tick dst_act_at = std::max(src_act_at, bank.actAllowedAt);
+                    activateBank(rank, bank, dst_act_at, dram_pkt->row);
+
+                    // RD phase: issue columnsPerRowBuffer read bursts to src
+                    Tick rd_col_at = src_bank_ref.colAllowedAt; // src_act_at + tRCD
+                    Tick rd_end_at = rd_col_at + columnsPerRowBuffer * tBURST;
+                    // tRTP: read-to-precharge minimum delay
+                    Tick src_pre_at = std::max(src_bank_ref.preAllowedAt,
+                                               rd_col_at + (columnsPerRowBuffer - 1) * tBURST + tRTP);
+                    prechargeBank(src_rank_ref, src_bank_ref, src_pre_at);
+
+                    // WR phase: issue columnsPerRowBuffer write bursts to dst after tRTW turnaround
+                    Tick wr_col_at = std::max(bank.colAllowedAt, rd_end_at + tRTW);
+                    Tick wr_end_at = wr_col_at + columnsPerRowBuffer * tBURST;
+                    // tWR: write-recovery before precharge
+                    Tick dst_pre_at = std::max(bank.preAllowedAt,
+                                               wr_col_at + (columnsPerRowBuffer - 1) * tBURST + tWR);
+                    prechargeBank(rank, bank, dst_pre_at);
+
+                    // bus is occupied through the last write burst
+                    cmd_at = wr_end_at;
+
+                    DPRINTF(DRAM, "ROWCOPY (inter-bank) rank%d/bank%d/row%d -> rank%d/bank%d/row%d "
+                                  "rd@%llu wr@%llu\n",
+                            dram_pkt->src_rank, dram_pkt->src_bank, dram_pkt->src1_row,
+                            dram_pkt->rank, dram_pkt->bank, dram_pkt->row,
+                            rd_col_at, wr_col_at);
+                }
+                break;
+            }
             default:
                 assert(false);
                 break;

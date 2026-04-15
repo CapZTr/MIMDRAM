@@ -204,8 +204,9 @@ class Request
         ROWOR,
         ROWNOT,
         ROWXOR,
-		ROWAP,
-		ROWAAP
+        ROWAP,
+        ROWAAP,
+        ROWCOPY  // Inter-bank row copy: src1 addr -> dest addr (may differ in bank/rank)
     };
 
     struct RowOpPayload {
