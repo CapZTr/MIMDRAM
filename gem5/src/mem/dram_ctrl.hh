@@ -687,6 +687,18 @@ class DRAMCtrl : public AbstractMemory
     void aapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
         uint32_t row2, bool act_overlapped);
 
+    /** ACT + ACT + ACT + PRE: 5ns between each ACT, PRE after tRAS + 2*tWLOV. */
+    void aaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
+        uint32_t row2, uint32_t row3);
+
+    /** ACT + NOT(tNOT after tRCD) + ACT + PRE. */
+    void anapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
+        uint32_t row2);
+
+    /** ACT×5 + PRE: 5ns between each ACT, PRE after tRAS + 4*tWLOV. */
+    void aaaaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
+        uint32_t row2, uint32_t row3, uint32_t row4, uint32_t row5);
+
     /**
      * Used for debugging to observe the contents of the queues.
      */
@@ -784,6 +796,7 @@ class DRAMCtrl : public AbstractMemory
     const Tick tXAW;
     const Tick tWL;
     const Tick tWLOV;
+    const Tick tNOT;
     const uint32_t activationLimit;
 
     /**

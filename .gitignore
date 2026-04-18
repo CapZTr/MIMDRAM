@@ -1,6 +1,8 @@
 *.exe
 *.ll
 *.o
+*.out
+*.patch
 *.pyc
 *parsetab.py
 */build/

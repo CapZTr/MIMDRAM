@@ -84,7 +84,7 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     tCK(p->tCK), tWTR(p->tWTR), tRTW(p->tRTW), tCS(p->tCS), tBURST(p->tBURST),
     tCCD_L(p->tCCD_L), tRCD(p->tRCD), tCL(p->tCL), tRP(p->tRP), tRAS(p->tRAS),
     tWR(p->tWR), tRTP(p->tRTP), tRFC(p->tRFC), tREFI(p->tREFI), tRRD(p->tRRD),
-    tRRD_L(p->tRRD_L), tXAW(p->tXAW), tWL(p->tWL), tWLOV(p->tWLOV),
+    tRRD_L(p->tRRD_L), tXAW(p->tXAW), tWL(p->tWL), tWLOV(p->tWLOV), tNOT(p->tNOT),
     activationLimit(p->activation_limit), memSchedPolicy(p->mem_sched_policy),
     addrMapping(p->addr_mapping), pageMgmt(p->page_policy),
     maxAccessesPerRow(p->max_accesses_per_row),
@@ -535,12 +535,12 @@ DRAMCtrl::addToWriteQueue(PacketPtr pkt, unsigned int pktCount)
             dram_pkt->src1_row = dram_pkt1->row;
         } else {
             // All other ops are strictly intra-bank
-            if (addrs->op != Request::ROWAP) {
+            if (addrs->op != Request::ROWAP && addrs->op != Request::ROWANAP && addrs->op != Request::ROWAAAP && addrs->op != Request::ROWAAAAAP) {
                 assert(dram_pkt->rank == dram_pkt1->rank);
                 assert(dram_pkt->bank == dram_pkt1->bank);
                 assert(dram_pkt->row / rowsPerSubarray == dram_pkt1->row / rowsPerSubarray);
             }
-            if (addrs->op != Request::ROWNOT && addrs->op != Request::ROWAAP && addrs->op != Request::ROWAP) {
+            if (addrs->op != Request::ROWNOT && addrs->op != Request::ROWAAP && addrs->op != Request::ROWAP && addrs->op != Request::ROWANAP && addrs->op != Request::ROWAAAP && addrs->op != Request::ROWAAAAAP) {
                 assert(dram_pkt->rank == dram_pkt2->rank);
                 assert(dram_pkt->bank == dram_pkt2->bank);
                 assert(dram_pkt->row / rowsPerSubarray == dram_pkt2->row / rowsPerSubarray);
@@ -1154,6 +1154,154 @@ DRAMCtrl::aapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
 }
 
 void
+DRAMCtrl::aaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row1, uint32_t row2, uint32_t row3)
+{
+    DPRINTF(DRAM, "Activate-Activate-Activate-Precharge at tick %d\n", act_tick);
+
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses = 0;
+
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+
+    // Three ACTs at tWLOV intervals; PRE after tRAS measured from first ACT
+    // plus the two inter-ACT delays.
+    bank_ref.preAllowedAt = act_tick + tRAS + 2 * tWLOV;
+
+    // Only the first ACT counts against tRRD and tXAW.
+    for (int i = 0; i < banksPerRank; i++) {
+        if (bankGroupArch && (bank_ref.bankgr == rank_ref.banks[i].bankgr)) {
+            rank_ref.banks[i].actAllowedAt = std::max(act_tick + tRRD_L,
+                                                      rank_ref.banks[i].actAllowedAt);
+        } else {
+            rank_ref.banks[i].actAllowedAt = std::max(act_tick + tRRD,
+                                                      rank_ref.banks[i].actAllowedAt);
+        }
+    }
+
+    if (!rank_ref.actTicks.empty()) {
+        rank_ref.actTicks.pop_back();
+        rank_ref.actTicks.push_front(act_tick);
+
+        Tick new_limit = rank_ref.actTicks.back() + tXAW;
+        if (rank_ref.actTicks.back() && act_tick < new_limit) {
+            for (int j = 0; j < banksPerRank; j++) {
+                rank_ref.banks[j].actAllowedAt =
+                    std::max(new_limit, rank_ref.banks[j].actAllowedAt);
+            }
+        }
+    }
+
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::anapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row1, uint32_t row2)
+{
+    DPRINTF(DRAM, "Activate-NOT-Activate-Precharge at tick %d\n", act_tick);
+
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses = 0;
+
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+
+    // Sequence: ACT1 → wait tRCD → NOT (tNOT) → ACT2 → wait tRAS → PRE
+    bank_ref.preAllowedAt = act_tick + tRCD + tNOT + tRAS;
+
+    // Only the first ACT counts against tRRD and tXAW.
+    for (int i = 0; i < banksPerRank; i++) {
+        if (bankGroupArch && (bank_ref.bankgr == rank_ref.banks[i].bankgr)) {
+            rank_ref.banks[i].actAllowedAt = std::max(act_tick + tRRD_L,
+                                                      rank_ref.banks[i].actAllowedAt);
+        } else {
+            rank_ref.banks[i].actAllowedAt = std::max(act_tick + tRRD,
+                                                      rank_ref.banks[i].actAllowedAt);
+        }
+    }
+
+    if (!rank_ref.actTicks.empty()) {
+        rank_ref.actTicks.pop_back();
+        rank_ref.actTicks.push_front(act_tick);
+
+        Tick new_limit = rank_ref.actTicks.back() + tXAW;
+        if (rank_ref.actTicks.back() && act_tick < new_limit) {
+            for (int j = 0; j < banksPerRank; j++) {
+                rank_ref.banks[j].actAllowedAt =
+                    std::max(new_limit, rank_ref.banks[j].actAllowedAt);
+            }
+        }
+    }
+
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::aaaaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row1, uint32_t row2, uint32_t row3, uint32_t row4, uint32_t row5)
+{
+    DPRINTF(DRAM, "Activate×5-Precharge at tick %d\n", act_tick);
+
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses = 0;
+
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+
+    // Five ACTs at tWLOV intervals; PRE after tRAS + 4*tWLOV.
+    bank_ref.preAllowedAt = act_tick + tRAS + 4 * tWLOV;
+
+    // Only the first ACT counts against tRRD and tXAW.
+    for (int i = 0; i < banksPerRank; i++) {
+        if (bankGroupArch && (bank_ref.bankgr == rank_ref.banks[i].bankgr)) {
+            rank_ref.banks[i].actAllowedAt = std::max(act_tick + tRRD_L,
+                                                      rank_ref.banks[i].actAllowedAt);
+        } else {
+            rank_ref.banks[i].actAllowedAt = std::max(act_tick + tRRD,
+                                                      rank_ref.banks[i].actAllowedAt);
+        }
+    }
+
+    if (!rank_ref.actTicks.empty()) {
+        rank_ref.actTicks.pop_back();
+        rank_ref.actTicks.push_front(act_tick);
+
+        Tick new_limit = rank_ref.actTicks.back() + tXAW;
+        if (rank_ref.actTicks.back() && act_tick < new_limit) {
+            for (int j = 0; j < banksPerRank; j++) {
+                rank_ref.banks[j].actAllowedAt =
+                    std::max(new_limit, rank_ref.banks[j].actAllowedAt);
+            }
+        }
+    }
+
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
 DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
 {
     DPRINTF(DRAM, "Timing access to addr %lld, rank/bank/row %d %d %d\n",
@@ -1182,6 +1330,16 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
         cmd_at = std::max(cmd_at, bank.actAllowedAt);
 
         // Do sequence of activate-activate-precharge operations
+        static const char* rowOpNames[] = {
+            "ROWAND", "ROWOR", "ROWNOT", "ROWXOR",
+            "ROWAP", "ROWAAP", "ROWCOPY",
+            "ROWANAP", "ROWAAAP", "ROWAAAAAP"
+        };
+        DPRINTF(DRAM, "RowOp %s rank %d bank %d dest_row %d src1_row %d src2_row %d\n",
+                rowOpNames[dram_pkt->row_op],
+                dram_pkt->rank, dram_pkt->bank,
+                dram_pkt->row, dram_pkt->src1_row, dram_pkt->src2_row);
+
         switch (dram_pkt->row_op) {
             case Request::ROWAND:
                 aapBank(rank, bank, cmd_at, dram_pkt->src1_row, Bank::B_T0,    true); cmd_at = bank.actAllowedAt;
@@ -1211,9 +1369,18 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
             case Request::ROWAP:
                 apBank (rank, bank, cmd_at, Bank::B_T0_T1_T2); cmd_at = bank.actAllowedAt;		//TODO replace Bank::B_T0_T1_T2 with correct bank
 		        break;
-	    case Request::ROWAAP:
-		aapBank(rank, bank, cmd_at, 0, 0, true); cmd_at = bank.actAllowedAt;	//TODO replace NULLs with correct banks
-		break;
+            case Request::ROWAAP:
+                aapBank(rank, bank, cmd_at, 0, 0, true); cmd_at = bank.actAllowedAt;	//TODO replace NULLs with correct banks
+                break;
+            case Request::ROWANAP:
+                anapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::ROWAAAP:
+                aaapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->src2_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::ROWAAAAAP:
+                aaaaapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->src2_row, dram_pkt->row, dram_pkt->row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
             case Request::ROWCOPY: {
                 bool same_subarray =
                     dram_pkt->src_rank == dram_pkt->rank &&

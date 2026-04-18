@@ -54,8 +54,11 @@ typedef struct {
  * cannot guarantee the physical start address is 128 MB-aligned, so the
  * block can span two physical subarray regions.
  *
- * Budget: 18 ambit (init_ambit) + 8*SCHED_MAX_BW + 4 data rows.
- * SCHED_MAX_BW=16 → 18 + 132 = 150 rows  ≪  512.
+ * Shared-pool budget (independent of op mix):
+ *   control rows (init_ambit): 18
+ *   lhs + rhs + out + partial + tmp + carry: BW + BW + 2*BW + BW + 1 + 2
+ * => total = 18 + (5*BW + 3)
+ * SCHED_MAX_BW=64 -> 18 + 323 = 341 rows, still within 512.
  * --------------------------------------------------------------------- */
 static unsigned *alloc_vec_all_banks(void) {
     unsigned *p = NULL;
@@ -239,9 +242,8 @@ void execute_row_copy_batch(const RowCopyTask *tasks, int task_count) {
 #define MAX_OPS_PER_STEP     64
 #define SCHED_MAX_BANKS      32
  
-/* Max bitwidth: keeps total row count below ROWS_PER_SUBARRAY (512).
- * Budget: 18 (ambit) + 8*16 + 4 = 150 rows.  Handles up to 16-bit ops. */
-#define SCHED_MAX_BW         16
+/* Compile-time upper bound only; actual allocations are schedule-derived. */
+#define SCHED_MAX_BW         64
  
 typedef enum { OP_MULI, OP_ADDI, OP_ROW_COPY } OpType;
  
@@ -262,45 +264,91 @@ typedef struct {
 } TimeStep;
  
 /* -----------------------------------------------------------------------
- * Pre-allocated row pools — one set per operation class.
+ * Shared row pools used by both add and mul.
  * All allocated from the subarray pool (see above).
  * --------------------------------------------------------------------- */
-static unsigned *g_mul_lhs    [SCHED_MAX_BW];
-static unsigned *g_mul_rhs    [SCHED_MAX_BW];
-static unsigned *g_mul_out    [2 * SCHED_MAX_BW];
-static unsigned *g_mul_partial[SCHED_MAX_BW];
-static unsigned *g_mul_tmp    [1];
-static unsigned *g_mul_carry  [2];
- 
-static unsigned *g_add_lhs[SCHED_MAX_BW];
-static unsigned *g_add_rhs[SCHED_MAX_BW];
-static unsigned *g_add_out[SCHED_MAX_BW + 1];
- 
-static void alloc_row_pools(void) {
-    for (int j = 0; j < SCHED_MAX_BW; j++) {
-        g_mul_lhs[j]                = alloc_vec_all_banks();
-        g_mul_rhs[j]                = alloc_vec_all_banks();
-        g_mul_out[j]                = alloc_vec_all_banks();
-        g_mul_out[SCHED_MAX_BW + j] = alloc_vec_all_banks();
-        g_mul_partial[j]            = alloc_vec_all_banks();
-        g_add_lhs[j]                = alloc_vec_all_banks();
-        g_add_rhs[j]                = alloc_vec_all_banks();
-        g_add_out[j]                = alloc_vec_all_banks();
-    }
-    g_add_out[SCHED_MAX_BW] = alloc_vec_all_banks();
-    g_mul_tmp[0]   = alloc_vec_all_banks();
-    g_mul_carry[0] = alloc_vec_all_banks();
-    g_mul_carry[1] = alloc_vec_all_banks();
+static unsigned *g_lhs    [SCHED_MAX_BW];
+static unsigned *g_rhs    [SCHED_MAX_BW];
+static unsigned *g_out    [2 * SCHED_MAX_BW];
+static unsigned *g_partial[SCHED_MAX_BW];
+static unsigned *g_tmp    [1];
+static unsigned *g_carry  [2];
+
+typedef struct {
+    int max_lhs_bw;
+    int max_rhs_bw;
+    int max_out_bw;
+    int max_partial_bw;
+} PoolWidths;
+
+static void init_pool_widths(PoolWidths *pw) {
+    memset(pw, 0, sizeof(*pw));
 }
- 
-/* -----------------------------------------------------------------------
- * Track the "current output" rows per bank so row_copy can find its src.
- * --------------------------------------------------------------------- */
-typedef enum { BANK_LAST_NONE, BANK_LAST_MUL, BANK_LAST_ADD } BankLastOp;
-static BankLastOp g_bank_last[SCHED_MAX_BANKS];
- 
-static unsigned **src_rows_for_bank(int bank) {
-    return (g_bank_last[bank] == BANK_LAST_MUL) ? g_mul_out : g_add_out;
+
+static int derive_pool_widths(const TimeStep *steps, int nsteps, PoolWidths *pw) {
+    init_pool_widths(pw);
+    for (int s = 0; s < nsteps; s++) {
+        const TimeStep *step = &steps[s];
+        for (int i = 0; i < step->count; i++) {
+            const SchedOp *op = &step->ops[i];
+            if (op->type == OP_MULI) {
+                if (op->lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = op->lhs_bw;
+                if (op->rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = op->rhs_bw;
+                if (op->lhs_bw + op->rhs_bw > pw->max_out_bw)
+                    pw->max_out_bw = op->lhs_bw + op->rhs_bw;
+                if (op->lhs_bw > pw->max_partial_bw)
+                    pw->max_partial_bw = op->lhs_bw;
+            } else if (op->type == OP_ADDI) {
+                int add_bw = (op->lhs_bw < op->rhs_bw) ? op->lhs_bw : op->rhs_bw; /* execute_add uses min */
+                if (op->lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = op->lhs_bw;
+                if (op->rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = op->rhs_bw;
+                if (add_bw > pw->max_out_bw) pw->max_out_bw = add_bw;
+            } else if (op->type == OP_ROW_COPY) {
+                if (op->bitwidth > pw->max_lhs_bw) pw->max_lhs_bw = op->bitwidth;
+            }
+        }
+    }
+
+    if (pw->max_lhs_bw > SCHED_MAX_BW || pw->max_rhs_bw > SCHED_MAX_BW ||
+        pw->max_partial_bw > SCHED_MAX_BW || pw->max_out_bw > 2 * SCHED_MAX_BW) {
+        fprintf(stderr, "schedule_runner: schedule bitwidth exceeds SCHED_MAX_BW=%d\n",
+                SCHED_MAX_BW);
+        return -1;
+    }
+    return 0;
+}
+
+static int check_row_budget(const PoolWidths *pw) {
+    int pool_rows =
+        pw->max_lhs_bw + pw->max_rhs_bw + pw->max_out_bw + pw->max_partial_bw +
+        1 + 2; /* tmp + carry */
+    int total_rows = 18 + pool_rows; /* 18 ambit control rows */
+    if (total_rows > ROWS_PER_SUBARRAY) {
+        fprintf(stderr,
+                "schedule_runner: row budget overflow: need %d rows (including 18 control rows), "
+                "but ROWS_PER_SUBARRAY=%d\n",
+                total_rows, ROWS_PER_SUBARRAY);
+        return -1;
+    }
+    return 0;
+}
+
+static void alloc_row_pools(const PoolWidths *pw) {
+    for (int j = 0; j < pw->max_lhs_bw; j++) {
+        g_lhs[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_rhs_bw; j++) {
+        g_rhs[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_out_bw; j++) {
+        g_out[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_partial_bw; j++) {
+        g_partial[j]            = alloc_vec_all_banks();
+    }
+    g_tmp[0]   = alloc_vec_all_banks();
+    g_carry[0] = alloc_vec_all_banks();
+    g_carry[1] = alloc_vec_all_banks();
 }
  
 /* -----------------------------------------------------------------------
@@ -414,8 +462,8 @@ static void execute_time_step(const TimeStep *step) {
  
         } else { /* OP_ROW_COPY */
             RowCopyTask *t  = &copy_tasks[n_copy++];
-            t->src      = src_rows_for_bank(op->src_bank);
-            t->dst      = g_add_lhs;
+            t->src      = g_out;
+            t->dst      = g_lhs;
             t->src_bank = op->src_bank;
             t->dst_bank = op->dst_bank;
             t->bitwidth = op->bitwidth;
@@ -435,10 +483,8 @@ static void execute_time_step(const TimeStep *step) {
         }
         execute_mul(grp->lhs_bw, grp->rhs_bw,
                     grp->bank_ids, grp->bank_count,
-                    g_mul_lhs, g_mul_rhs, g_mul_out,
-                    g_mul_partial, g_mul_tmp, g_mul_carry);
-        for (int k = 0; k < grp->bank_count; k++)
-            g_bank_last[grp->bank_ids[k]] = BANK_LAST_MUL;
+                    g_lhs, g_rhs, g_out,
+                    g_partial, g_tmp, g_carry);
     }
  
     /* --- dispatch add groups ----------------------------------------- */
@@ -451,9 +497,7 @@ static void execute_time_step(const TimeStep *step) {
         }
         execute_add(grp->lhs_bw, grp->rhs_bw,
                     grp->bank_ids, grp->bank_count,
-                    g_add_lhs, g_add_rhs, g_add_out);
-        for (int k = 0; k < grp->bank_count; k++)
-            g_bank_last[grp->bank_ids[k]] = BANK_LAST_ADD;
+                    g_lhs, g_rhs, g_out);
     }
  
     /* --- dispatch row copies ----------------------------------------- */
@@ -485,19 +529,23 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "-v") == 0)  g_verbose = 1;
     }
  
-    /* init_ambit() first (18 rows), then data rows — all via sequential
-     * posix_memalign(ALIGNMENT, ALIGNMENT) so they are physically contiguous
-     * and within a single DRAM subarray. */
-    init_ambit();
-    alloc_row_pools();
- 
     static TimeStep steps[MAX_SCHEDULE_STEPS];
     int nsteps = 0;
- 
+    PoolWidths widths;
+
     if (parse_schedule(argv[1], steps, &nsteps) != 0) {
         fprintf(stderr, "schedule_runner: failed to parse '%s'\n", argv[1]);
         return 1;
     }
+
+    if (derive_pool_widths(steps, nsteps, &widths) != 0) return 1;
+    if (check_row_budget(&widths) != 0) return 1;
+
+    /* init_ambit() first (18 rows), then data rows — all via sequential
+     * posix_memalign(ALIGNMENT, ALIGNMENT) so they are physically contiguous
+     * and within a single DRAM subarray. */
+    init_ambit();
+    alloc_row_pools(&widths);
  
     if (g_verbose >= 1)
         printf("Parsed %d time step(s) from '%s'\n\n", nsteps, argv[1]);
@@ -512,7 +560,6 @@ int main(int argc, char *argv[]) {
             printf("=== %s (iter %d) ===\n",
                    iter == 0 ? "Warmup     " : "Measurement", iter);
  
-        memset(g_bank_last, 0, sizeof(g_bank_last));
         for (int s = 0; s < nsteps; s++)
             execute_time_step(&steps[s]);
  

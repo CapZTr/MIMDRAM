@@ -231,6 +231,9 @@ class DRAMCtrl(AbstractMemory):
     # time between two activates in overlapped AAP
     tWLOV = Param.Latency("Word-line delay (overlapped activate)")
 
+    # sense-amplifier NOT operation latency (ANAP)
+    tNOT = Param.Latency("Sense-amplifier NOT (inversion) latency")
+
     # Currently rolled into other params
     ######################################################################
 
@@ -374,6 +377,7 @@ class DDR3_1600_x64(DRAMCtrl):
 
     tWL = '32ns' # FIXME not actually used
     tWLOV = '4ns'
+    tNOT = '35ns'
 
     # <=85C, half for >85C
     tREFI = '7.8us'
@@ -587,6 +591,7 @@ class DDR4_2400_x64(DRAMCtrl):
 
     tWL = '32ns' # FIXME not actually used
     tWLOV = '4ns'
+    tNOT = '35ns'
 
     # Current values from datasheet
     IDD0 = '64mA'
@@ -669,8 +674,8 @@ class LPDDR2_S4_1066_x32(DRAMCtrl):
     tRRD = '10.0ns'
 
     # Irrespective of density, tFAW is 50 ns
-    tXAW = '50ns'
-    activation_limit = 4
+    tXAW = '0ns'
+    activation_limit = 0
 
     # Current values from datasheet
     IDD0 = '15mA'
@@ -825,8 +830,8 @@ class LPDDR3_1600_x32(DRAMCtrl):
     tRRD = '10.0ns'
 
     # Irrespective of size, tFAW is 50 ns
-    tXAW = '50ns'
-    activation_limit = 4
+    tXAW = '0ns'
+    activation_limit = 0
 
     # Current values from datasheet
     IDD0 = '8mA'
@@ -1004,8 +1009,8 @@ class HBM_1000_4H_x128(DRAMCtrl):
     tRRD = '4ns'
 
     # from MemCon example, tFAW is 30ns with 2ns tCK
-    tXAW = '30ns'
-    activation_limit = 4
+    tXAW = '0ns'
+    activation_limit = 0
 
     # 4tCK
     tXP = '8ns'

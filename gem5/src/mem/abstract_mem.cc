@@ -373,6 +373,15 @@ AbstractMemory::access(PacketPtr pkt)
 			case Request::ROWAAP:
 				//TODO implement
 				break;
+            case Request::ROWANAP:
+				//TODO implement
+				break;
+			case Request::ROWAAAP:
+				//TODO implement
+				break;
+			case Request::ROWAAAAAP:
+				//TODO implement
+				break;
             default:
                 assert(false);
                 break;

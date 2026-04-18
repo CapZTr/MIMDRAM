@@ -7,6 +7,9 @@
 extern void rowop_ap(void *dst);
 extern void rowop_aap(void *dst, void *src);
 extern void rowop_copy(void *dst, void *src);
+extern void rowop_aaap(void *dst, void *src1, void *src2);
+extern void rowop_anap(void *dst, void *src);
+extern void rowop_aaaaap(void *dst, void *src1, void *src2, void *src3, void *src4);
 
 #define ROW_SIZE 8192
 #define BANK_COUNT 16
@@ -22,9 +25,12 @@ extern void rowop_copy(void *dst, void *src);
 #define VECTOR(ptr) ((void *)(ptr) + base_row*ROW_SIZE)
 #define FOR_ALL_ROWS_IN_VECTOR for(int row = 0; row < per_col_rows - base_row && row < ROWS_PER_VECTOR; row ++)
 #define ROW(ptr) ((void *)(ptr) + row*ROW_SIZE)
-#define AAP_VECTORS(dst, src) FOR_ALL_ROWS_IN_VECTOR { rowop_aap(ROW(dst), ROW(src));}
-#define COPY_VECTORS(dst, src) FOR_ALL_ROWS_IN_VECTOR { rowop_copy(ROW(dst), ROW(src));}
-#define AP_VECTOR(dst)        FOR_ALL_ROWS_IN_VECTOR { rowop_ap (ROW(dst));}
+#define AAP_VECTORS(dst, src)              FOR_ALL_ROWS_IN_VECTOR { rowop_aap  (ROW(dst), ROW(src)); }
+#define COPY_VECTORS(dst, src)             FOR_ALL_ROWS_IN_VECTOR { rowop_copy (ROW(dst), ROW(src)); }
+#define AP_VECTOR(dst)                     FOR_ALL_ROWS_IN_VECTOR { rowop_ap   (ROW(dst)); }
+#define AAAP_VECTORS(dst, src1, src2)      FOR_ALL_ROWS_IN_VECTOR { rowop_aaap (ROW(dst), ROW(src1), ROW(src2)); }
+#define ANAP_VECTORS(dst, src)             FOR_ALL_ROWS_IN_VECTOR { rowop_anap (ROW(dst), ROW(src)); }
+#define AAAAAP_VECTORS(dst, s1, s2, s3, s4) FOR_ALL_ROWS_IN_VECTOR { rowop_aaaaap(ROW(dst), ROW(s1), ROW(s2), ROW(s3), ROW(s4)); }
 
 static void *B_T0         = NULL;
 static void *B_T1         = NULL;
