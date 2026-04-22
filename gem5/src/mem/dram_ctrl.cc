@@ -1741,10 +1741,29 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
 
                     // ACT src row (cmd_at already accounts for dst bank's actAllowedAt)
                     Tick src_act_at = std::max(cmd_at, src_bank_ref.actAllowedAt);
+                    // A pending prechargeEvent or powerEvent in src_rank fires at the
+                    // same tick as src_act_at, processActivateEvent would try to
+                    // schedule PWR_ACT while powerEvent is already queued → panic.
+                    // Bump src_act_at to fire strictly after those events complete.
+                    if (src_rank_ref.prechargeEvent.scheduled())
+                        src_act_at = std::max(src_act_at,
+                                              src_rank_ref.prechargeEvent.when() + 1);
+                    if (src_rank_ref.powerEvent.scheduled())
+                        src_act_at = std::max(src_act_at,
+                                              src_rank_ref.powerEvent.when() + 1);
                     activateBank(src_rank_ref, src_bank_ref, src_act_at, dram_pkt->src1_row);
 
                     // ACT dst row (tRRD propagated into bank.actAllowedAt by activateBank)
                     Tick dst_act_at = std::max(src_act_at, bank.actAllowedAt);
+                    // Apply the same guard for a cross-rank destination.
+                    if (&rank != &src_rank_ref) {
+                        if (rank.prechargeEvent.scheduled())
+                            dst_act_at = std::max(dst_act_at,
+                                                  rank.prechargeEvent.when() + 1);
+                        if (rank.powerEvent.scheduled())
+                            dst_act_at = std::max(dst_act_at,
+                                                  rank.powerEvent.when() + 1);
+                    }
                     activateBank(rank, bank, dst_act_at, dram_pkt->row);
 
                     // RD phase: issue columnsPerRowBuffer read bursts to src
