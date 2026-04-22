@@ -238,31 +238,35 @@ void execute_row_copy_batch(const RowCopyTask *tasks, int task_count) {
  * Schedule runner
  * ===================================================================== */
  
-#define MAX_SCHEDULE_STEPS  512
-#define MAX_OPS_PER_STEP     64
 #define SCHED_MAX_BANKS      32
  
 /* Compile-time upper bound only; actual allocations are schedule-derived. */
 #define SCHED_MAX_BW         64
  
-typedef enum { OP_MULI, OP_ADDI, OP_ROW_COPY } OpType;
- 
+typedef enum { OP_MULI = 0, OP_ADDI = 1, OP_ROW_COPY = 2 } OpType;
+
 typedef struct {
-    OpType type;
-    /* addi / muli */
-    int lhs_bw, rhs_bw, bank;
-    /* row_copy */
-    int src_bank, dst_bank, bitwidth;
-    /* timing (informational) */
-    int start, end;
-} SchedOp;
- 
+    char     magic[8];
+    uint32_t version;
+    uint32_t record_size;
+    uint64_t num_records;
+    int64_t  last_end_time;
+} TraceHeader;
+
 typedef struct {
-    int     start_time;
-    SchedOp ops[MAX_OPS_PER_STEP];
-    int     count;
-} TimeStep;
- 
+    int64_t  start;
+    int64_t  end;
+    uint32_t banks;
+    uint16_t lhs_bw;
+    uint16_t rhs_bw;
+    uint8_t  kind;
+    uint8_t  src;
+    uint8_t  dst;
+    uint8_t  pad[5];
+} TraceRecord;
+_Static_assert(sizeof(TraceHeader) == 32, "TraceHeader must be 32 bytes");
+_Static_assert(sizeof(TraceRecord) == 32, "TraceRecord must be 32 bytes");
+
 /* -----------------------------------------------------------------------
  * Shared row pools used by both add and mul.
  * All allocated from the subarray pool (see above).
@@ -283,39 +287,6 @@ typedef struct {
 
 static void init_pool_widths(PoolWidths *pw) {
     memset(pw, 0, sizeof(*pw));
-}
-
-static int derive_pool_widths(const TimeStep *steps, int nsteps, PoolWidths *pw) {
-    init_pool_widths(pw);
-    for (int s = 0; s < nsteps; s++) {
-        const TimeStep *step = &steps[s];
-        for (int i = 0; i < step->count; i++) {
-            const SchedOp *op = &step->ops[i];
-            if (op->type == OP_MULI) {
-                if (op->lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = op->lhs_bw;
-                if (op->rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = op->rhs_bw;
-                if (op->lhs_bw + op->rhs_bw > pw->max_out_bw)
-                    pw->max_out_bw = op->lhs_bw + op->rhs_bw;
-                if (op->lhs_bw > pw->max_partial_bw)
-                    pw->max_partial_bw = op->lhs_bw;
-            } else if (op->type == OP_ADDI) {
-                int add_bw = (op->lhs_bw < op->rhs_bw) ? op->lhs_bw : op->rhs_bw; /* execute_add uses min */
-                if (op->lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = op->lhs_bw;
-                if (op->rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = op->rhs_bw;
-                if (add_bw > pw->max_out_bw) pw->max_out_bw = add_bw;
-            } else if (op->type == OP_ROW_COPY) {
-                if (op->bitwidth > pw->max_lhs_bw) pw->max_lhs_bw = op->bitwidth;
-            }
-        }
-    }
-
-    if (pw->max_lhs_bw > SCHED_MAX_BW || pw->max_rhs_bw > SCHED_MAX_BW ||
-        pw->max_partial_bw > SCHED_MAX_BW || pw->max_out_bw > 2 * SCHED_MAX_BW) {
-        fprintf(stderr, "schedule_runner: schedule bitwidth exceeds SCHED_MAX_BW=%d\n",
-                SCHED_MAX_BW);
-        return -1;
-    }
-    return 0;
 }
 
 static int check_row_budget(const PoolWidths *pw) {
@@ -354,164 +325,165 @@ static void alloc_row_pools(const PoolWidths *pw) {
 /* -----------------------------------------------------------------------
  * Parser — only C standard library, no regex / strtok tricks.
  * --------------------------------------------------------------------- */
-static int parse_schedule(const char *path, TimeStep *steps, int *nsteps) {
-    FILE *f = fopen(path, "r");
-    if (!f) { perror(path); return -1; }
- 
-    char line[512];
-    *nsteps = 0;
-    int cur = -1;
- 
-    while (fgets(line, sizeof(line), f)) {
-        int t;
-        if (sscanf(line, "start_time=%d:", &t) == 1) {
-            if (*nsteps >= MAX_SCHEDULE_STEPS) {
-                fprintf(stderr, "schedule_runner: too many time steps (max %d)\n",
-                        MAX_SCHEDULE_STEPS);
-                fclose(f);
-                return -1;
-            }
-            cur = (*nsteps)++;
-            steps[cur].start_time = t;
-            steps[cur].count      = 0;
-            continue;
-        }
- 
-        if (cur < 0 || steps[cur].count >= MAX_OPS_PER_STEP) continue;
- 
-        SchedOp *op = &steps[cur].ops[steps[cur].count];
-        int a, b, c, d, e;
- 
-        if (sscanf(line,
-                   " muli(lhs_bw=%d, rhs_bw=%d, start=%d, end=%d, bank=%d)",
-                   &a, &b, &c, &d, &e) == 5) {
-            op->type   = OP_MULI;
-            op->lhs_bw = a; op->rhs_bw = b;
-            op->start  = c; op->end    = d; op->bank = e;
-            steps[cur].count++;
- 
-        } else if (sscanf(line,
-                          " addi(lhs_bw=%d, rhs_bw=%d, start=%d, end=%d, bank=%d)",
-                          &a, &b, &c, &d, &e) == 5) {
-            op->type   = OP_ADDI;
-            op->lhs_bw = a; op->rhs_bw = b;
-            op->start  = c; op->end    = d; op->bank = e;
-            steps[cur].count++;
- 
-        } else if (sscanf(line,
-                          " row_copy(src_bank=%d, dst_bank=%d, bitwidth=%d, start=%d, end=%d)",
-                          &a, &b, &c, &d, &e) == 5) {
-            op->type     = OP_ROW_COPY;
-            op->src_bank = a; op->dst_bank = b; op->bitwidth = c;
-            op->start    = d; op->end      = e;
-            steps[cur].count++;
-        }
-        /* Unrecognised lines (blank, comments, etc.) are silently skipped */
+static int validate_record(const TraceRecord *rec) {
+    if (rec->kind > OP_ROW_COPY) return -1;
+    if (rec->end < rec->start) return -1;
+    if (rec->lhs_bw > SCHED_MAX_BW || rec->rhs_bw > SCHED_MAX_BW) return -1;
+    if (rec->kind == OP_ROW_COPY && (rec->src >= SCHED_MAX_BANKS || rec->dst >= SCHED_MAX_BANKS))
+        return -1;
+    return 0;
+}
+
+static int read_trace_header(FILE *f, TraceHeader *hdr) {
+    if (fread(hdr, sizeof(*hdr), 1, f) != 1) return -1;
+    if (memcmp(hdr->magic, "CIMTRACE", 8) != 0) return -1;
+    if (hdr->version != 1 || hdr->record_size != sizeof(TraceRecord)) return -1;
+    return 0;
+}
+
+static int bank_mask_to_ids(uint32_t mask, int *bank_ids) {
+    int n = 0;
+    for (int b = 0; b < SCHED_MAX_BANKS; b++) {
+        if (mask & (1u << b)) bank_ids[n++] = b;
     }
- 
+    return n;
+}
+
+static void execute_trace_record(const TraceRecord *rec) {
+    if (rec->kind == OP_MULI || rec->kind == OP_ADDI) {
+        int bank_ids[SCHED_MAX_BANKS];
+        int bank_count = bank_mask_to_ids(rec->banks, bank_ids);
+
+        if (g_verbose >= 1) {
+            printf("  %s lhs=%-2u rhs=%-2u  banks:",
+                   rec->kind == OP_MULI ? "MULI" : "ADDI",
+                   rec->lhs_bw, rec->rhs_bw);
+            for (int k = 0; k < bank_count; k++) printf(" %d", bank_ids[k]);
+            printf("\n");
+        }
+
+        if (rec->kind == OP_MULI) {
+            execute_mul((int)rec->lhs_bw, (int)rec->rhs_bw,
+                        bank_ids, bank_count,
+                        g_lhs, g_rhs, g_out,
+                        g_partial, g_tmp, g_carry);
+        } else {
+            execute_add((int)rec->lhs_bw, (int)rec->rhs_bw,
+                        bank_ids, bank_count,
+                        g_lhs, g_rhs, g_out);
+        }
+    } else {
+        RowCopyTask task;
+        task.src = g_out;
+        task.dst = g_lhs;
+        task.src_bank = rec->src;
+        task.dst_bank = rec->dst;
+        task.bitwidth = rec->lhs_bw;
+
+        if (g_verbose >= 1) {
+            printf("  COPY  bank %d->%d (bw=%d)\n",
+                   task.src_bank, task.dst_bank, task.bitwidth);
+        }
+        execute_row_copy_batch(&task, 1);
+    }
+}
+
+static int derive_pool_widths_from_trace(const char *path, PoolWidths *pw, TraceHeader *out_hdr) {
+    init_pool_widths(pw);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    setvbuf(f, NULL, _IOFBF, 1 << 20);
+
+    TraceHeader hdr;
+    if (read_trace_header(f, &hdr) != 0) {
+        fprintf(stderr, "schedule_runner: invalid trace header in '%s'\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    for (uint64_t i = 0; i < hdr.num_records; i++) {
+        TraceRecord rec;
+        if (fread(&rec, sizeof(rec), 1, f) != 1) {
+            fprintf(stderr, "schedule_runner: truncated trace at record %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
+        }
+        if (validate_record(&rec) != 0) {
+            fprintf(stderr, "schedule_runner: invalid record at index %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
+        }
+
+        if (rec.kind == OP_MULI) {
+            if (rec.lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = rec.lhs_bw;
+            if (rec.rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = rec.rhs_bw;
+            if ((int)rec.lhs_bw + (int)rec.rhs_bw > pw->max_out_bw)
+                pw->max_out_bw = rec.lhs_bw + rec.rhs_bw;
+            if (rec.lhs_bw > pw->max_partial_bw) pw->max_partial_bw = rec.lhs_bw;
+        } else if (rec.kind == OP_ADDI) {
+            int add_bw = (rec.lhs_bw < rec.rhs_bw) ? rec.lhs_bw : rec.rhs_bw;
+            if (rec.lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = rec.lhs_bw;
+            if (rec.rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = rec.rhs_bw;
+            if (add_bw > pw->max_out_bw) pw->max_out_bw = add_bw;
+        } else {
+            if (rec.lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = rec.lhs_bw;
+        }
+    }
+
+    if (pw->max_lhs_bw > SCHED_MAX_BW || pw->max_rhs_bw > SCHED_MAX_BW ||
+        pw->max_partial_bw > SCHED_MAX_BW || pw->max_out_bw > 2 * SCHED_MAX_BW) {
+        fprintf(stderr, "schedule_runner: schedule bitwidth exceeds SCHED_MAX_BW=%d\n", SCHED_MAX_BW);
+        fclose(f);
+        return -1;
+    }
+
+    if (out_hdr) *out_hdr = hdr;
     fclose(f);
     return 0;
 }
- 
-/* -----------------------------------------------------------------------
- * Group same-(lhs_bw, rhs_bw) ops so they run in a single batched call.
- * --------------------------------------------------------------------- */
-typedef struct {
-    int lhs_bw, rhs_bw;
-    int bank_ids[SCHED_MAX_BANKS];
-    int bank_count;
-} OpGroup;
- 
-static int find_or_add_group(OpGroup *groups, int *n, int lhs_bw, int rhs_bw) {
-    for (int i = 0; i < *n; i++)
-        if (groups[i].lhs_bw == lhs_bw && groups[i].rhs_bw == rhs_bw)
-            return i;
-    int i = (*n)++;
-    groups[i].lhs_bw    = lhs_bw;
-    groups[i].rhs_bw    = rhs_bw;
-    groups[i].bank_count = 0;
-    return i;
-}
- 
-/* -----------------------------------------------------------------------
- * Execute one time-step: group → dispatch.
- * --------------------------------------------------------------------- */
-static void execute_time_step(const TimeStep *step) {
-    OpGroup   mul_groups[MAX_OPS_PER_STEP];
-    OpGroup   add_groups[MAX_OPS_PER_STEP];
-    int       n_mul = 0, n_add = 0;
- 
-    RowCopyTask copy_tasks[MAX_OPS_PER_STEP];
-    int         n_copy = 0;
- 
-    /* --- classify and group ------------------------------------------ */
-    for (int i = 0; i < step->count; i++) {
-        const SchedOp *op = &step->ops[i];
- 
-        if (op->type == OP_MULI) {
-            int g = find_or_add_group(mul_groups, &n_mul, op->lhs_bw, op->rhs_bw);
-            OpGroup *grp = &mul_groups[g];
-            if (grp->bank_count < SCHED_MAX_BANKS)
-                grp->bank_ids[grp->bank_count++] = op->bank;
- 
-        } else if (op->type == OP_ADDI) {
-            int g = find_or_add_group(add_groups, &n_add, op->lhs_bw, op->rhs_bw);
-            OpGroup *grp = &add_groups[g];
-            if (grp->bank_count < SCHED_MAX_BANKS)
-                grp->bank_ids[grp->bank_count++] = op->bank;
- 
-        } else { /* OP_ROW_COPY */
-            RowCopyTask *t  = &copy_tasks[n_copy++];
-            t->src      = g_out;
-            t->dst      = g_lhs;
-            t->src_bank = op->src_bank;
-            t->dst_bank = op->dst_bank;
-            t->bitwidth = op->bitwidth;
-        }
+
+static int execute_trace_once(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    setvbuf(f, NULL, _IOFBF, 1 << 20);
+
+    TraceHeader hdr;
+    if (read_trace_header(f, &hdr) != 0) {
+        fprintf(stderr, "schedule_runner: invalid trace header in '%s'\n", path);
+        fclose(f);
+        return -1;
     }
- 
-    if (g_verbose >= 1)
-        printf("[t=%-4d] %d op(s)\n", step->start_time, step->count);
- 
-    /* --- dispatch mul groups ----------------------------------------- */
-    for (int g = 0; g < n_mul; g++) {
-        OpGroup *grp = &mul_groups[g];
-        if (g_verbose >= 1) {
-            printf("  MULI lhs=%-2d rhs=%-2d  banks:", grp->lhs_bw, grp->rhs_bw);
-            for (int k = 0; k < grp->bank_count; k++) printf(" %d", grp->bank_ids[k]);
-            printf("\n");
+
+    int64_t current_start = 0;
+    int has_start = 0;
+
+    for (uint64_t i = 0; i < hdr.num_records; i++) {
+        TraceRecord rec;
+        if (fread(&rec, sizeof(rec), 1, f) != 1) {
+            fprintf(stderr, "schedule_runner: truncated trace at record %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
         }
-        execute_mul(grp->lhs_bw, grp->rhs_bw,
-                    grp->bank_ids, grp->bank_count,
-                    g_lhs, g_rhs, g_out,
-                    g_partial, g_tmp, g_carry);
-    }
- 
-    /* --- dispatch add groups ----------------------------------------- */
-    for (int g = 0; g < n_add; g++) {
-        OpGroup *grp = &add_groups[g];
-        if (g_verbose >= 1) {
-            printf("  ADDI lhs=%-2d rhs=%-2d  banks:", grp->lhs_bw, grp->rhs_bw);
-            for (int k = 0; k < grp->bank_count; k++) printf(" %d", grp->bank_ids[k]);
-            printf("\n");
+        if (validate_record(&rec) != 0) {
+            fprintf(stderr, "schedule_runner: invalid record at index %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
         }
-        execute_add(grp->lhs_bw, grp->rhs_bw,
-                    grp->bank_ids, grp->bank_count,
-                    g_lhs, g_rhs, g_out);
-    }
- 
-    /* --- dispatch row copies ----------------------------------------- */
-    if (n_copy > 0) {
-        if (g_verbose >= 1) {
-            printf("  COPY");
-            for (int t = 0; t < n_copy; t++)
-                printf("  bank %d->%d (bw=%d)",
-                       copy_tasks[t].src_bank, copy_tasks[t].dst_bank,
-                       copy_tasks[t].bitwidth);
-            printf("\n");
+
+        if (!has_start || rec.start != current_start) {
+            current_start = rec.start;
+            has_start = 1;
+            if (g_verbose >= 1) printf("[t=%-4lld]\n", (long long)current_start);
         }
-        execute_row_copy_batch(copy_tasks, n_copy);
+        execute_trace_record(&rec);
     }
+    fclose(f);
+    return 0;
 }
  
 /* -----------------------------------------------------------------------
@@ -519,7 +491,7 @@ static void execute_time_step(const TimeStep *step) {
  * --------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <schedule.txt> [-v|-vv]\n", argv[0]);
+        fprintf(stderr, "usage: %s <schedule.bin> [-v|-vv]\n", argv[0]);
         return 1;
     }
  
@@ -529,16 +501,9 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "-v") == 0)  g_verbose = 1;
     }
  
-    static TimeStep steps[MAX_SCHEDULE_STEPS];
-    int nsteps = 0;
     PoolWidths widths;
-
-    if (parse_schedule(argv[1], steps, &nsteps) != 0) {
-        fprintf(stderr, "schedule_runner: failed to parse '%s'\n", argv[1]);
-        return 1;
-    }
-
-    if (derive_pool_widths(steps, nsteps, &widths) != 0) return 1;
+    TraceHeader hdr;
+    if (derive_pool_widths_from_trace(argv[1], &widths, &hdr) != 0) return 1;
     if (check_row_budget(&widths) != 0) return 1;
 
     /* init_ambit() first (18 rows), then data rows — all via sequential
@@ -547,8 +512,10 @@ int main(int argc, char *argv[]) {
     init_ambit();
     alloc_row_pools(&widths);
  
-    if (g_verbose >= 1)
-        printf("Parsed %d time step(s) from '%s'\n\n", nsteps, argv[1]);
+    if (g_verbose >= 1) {
+        printf("Loaded trace '%s': records=%llu, last_end_time=%lld\n\n",
+               argv[1], (unsigned long long)hdr.num_records, (long long)hdr.last_end_time);
+    }
  
     /* Two iterations: first is warmup, second is the measured run.
      * m5_reset_stats at the top of each iteration ensures only the
@@ -560,8 +527,7 @@ int main(int argc, char *argv[]) {
             printf("=== %s (iter %d) ===\n",
                    iter == 0 ? "Warmup     " : "Measurement", iter);
  
-        for (int s = 0; s < nsteps; s++)
-            execute_time_step(&steps[s]);
+        if (execute_trace_once(argv[1]) != 0) return 1;
  
         if (g_verbose >= 1) printf("\n");
     }
