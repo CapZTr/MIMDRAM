@@ -382,6 +382,85 @@ AbstractMemory::access(PacketPtr pkt)
 			case Request::ROWAAAAAP:
 				//TODO implement
 				break;
+            // PUD COTS DDR4 primitives
+            case Request::ROWCLONE:
+                // APA intra-subarray: dst copies src
+                for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t))
+                    *dest++ = *src1++;
+                break;
+            case Request::MRC: {
+                // Multi-Row Copy: copy src1 (R_first) into every row up to dest (R_last)
+                uint64_t *row = (uint64_t*)(pmemAddr + addrs->src1 - range.start());
+                uint64_t *end = (uint64_t*)(pmemAddr + addrs->dest - range.start());
+                while (row <= end) {
+                    uint64_t *s = (uint64_t*)(pmemAddr + addrs->src1 - range.start());
+                    for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t))
+                        row[i / sizeof(uint64_t)] = s[i / sizeof(uint64_t)];
+                    row += ROW_SIZE / sizeof(uint64_t);
+                }
+                break;
+            }
+            case Request::MAJ: {
+                // Majority among all rows from src1 (R_first) to dest (R_last)
+                // For each bit position, count set bits across N rows; majority wins
+                int n_rows = (addrs->dest - addrs->src1) / ROW_SIZE + 1;
+                for (int i = 0; i < ROW_SIZE / (int)sizeof(uint64_t); i++) {
+                    uint64_t result = 0;
+                    for (int bit = 0; bit < 64; bit++) {
+                        int ones = 0;
+                        for (int r = 0; r < n_rows; r++) {
+                            uint64_t *rptr = (uint64_t*)(pmemAddr +
+                                addrs->src1 - range.start() + r * ROW_SIZE);
+                            if ((rptr[i] >> bit) & 1) ones++;
+                        }
+                        if (ones > n_rows / 2)
+                            result |= (1ULL << bit);
+                    }
+                    // Write majority result back to all rows in range
+                    for (int r = 0; r < n_rows; r++) {
+                        uint64_t *rptr = (uint64_t*)(pmemAddr +
+                            addrs->src1 - range.start() + r * ROW_SIZE);
+                        rptr[i] = result;
+                    }
+                }
+                break;
+            }
+            case Request::BULK_WRITE: {
+                // Write write_data pattern to all N rows from src1 to dest
+                int n_rows = (addrs->dest - addrs->src1) / ROW_SIZE + 1;
+                for (int r = 0; r < n_rows; r++) {
+                    uint64_t *rptr = (uint64_t*)(pmemAddr +
+                        addrs->src1 - range.start() + r * ROW_SIZE);
+                    //TODO Adding write_data payload in Request creates a problem for LSQ
+                    //for (int i = 0; i < ROW_SIZE / (int)sizeof(uint64_t); i++)
+                    //    rptr[i] = addrs->write_data;
+                }
+                break;
+            }
+            case Request::NOT_XSUB:
+                // Cross-subarray NOT: dst = ~src1 (open-bitline NOT side of SA)
+                for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t))
+                    *dest++ = ~*src1++;
+                break;
+            case Request::AND_XSUB:
+                // Cross-subarray AND: com rows (dest) = ref (src1) AND com (dest)
+                for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t)) {
+                    *dest = *src1++ & *dest;
+                    dest++;
+                }
+                break;
+            case Request::OR_XSUB:
+                // Cross-subarray OR: com rows (dest) = ref (src1) OR com (dest)
+                for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t)) {
+                    *dest = *src1++ | *dest;
+                    dest++;
+                }
+                break;
+            case Request::FRAC:
+                // VDD/2 initialisation: write all-ones as sentinel for fractional voltage
+                for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t))
+                    *dest++ = ~0ULL;
+                break;
             default:
                 assert(false);
                 break;

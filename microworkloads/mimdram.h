@@ -10,6 +10,15 @@ extern void rowop_copy(void *dst, void *src);
 extern void rowop_aaap(void *dst, void *src1, void *src2);
 extern void rowop_anap(void *dst, void *src);
 extern void rowop_aaaaap(void *dst, void *src1, void *src2, void *src3, void *src4);
+/* PUD COTS DDR4 primitives */
+extern void rowop_rowclone(void *dst, void *src);
+extern void rowop_mrc(void *dst_last, void *src_first);
+extern void rowop_maj(void *dst_last, void *src_first);
+extern void rowop_bulk_write(void *dst_last, void *src_first, uint64_t data);
+extern void rowop_not_xsub(void *dst, void *src);
+extern void rowop_and_xsub(void *com, void *ref);
+extern void rowop_or_xsub(void *com, void *ref);
+extern void rowop_frac(void *dst);
 
 #define ROW_SIZE 8192
 #define BANK_COUNT 16
@@ -28,9 +37,18 @@ extern void rowop_aaaaap(void *dst, void *src1, void *src2, void *src3, void *sr
 #define AAP_VECTORS(dst, src)              FOR_ALL_ROWS_IN_VECTOR { rowop_aap  (ROW(dst), ROW(src)); }
 #define COPY_VECTORS(dst, src)             FOR_ALL_ROWS_IN_VECTOR { rowop_copy (ROW(dst), ROW(src)); }
 #define AP_VECTOR(dst)                     FOR_ALL_ROWS_IN_VECTOR { rowop_ap   (ROW(dst)); }
-#define AAAP_VECTORS(dst, src1, src2)      FOR_ALL_ROWS_IN_VECTOR { rowop_aaap (ROW(dst), ROW(src1), ROW(src2)); }
-#define ANAP_VECTORS(dst, src)             FOR_ALL_ROWS_IN_VECTOR { rowop_anap (ROW(dst), ROW(src)); }
-#define AAAAAP_VECTORS(dst, s1, s2, s3, s4) FOR_ALL_ROWS_IN_VECTOR { rowop_aaaaap(ROW(dst), ROW(s1), ROW(s2), ROW(s3), ROW(s4)); }
+#define AAAP_VECTORS(dst, src1, src2)        FOR_ALL_ROWS_IN_VECTOR { rowop_aaap      (ROW(dst), ROW(src1), ROW(src2)); }
+#define ANAP_VECTORS(dst, src)               FOR_ALL_ROWS_IN_VECTOR { rowop_anap      (ROW(dst), ROW(src)); }
+#define AAAAAP_VECTORS(dst, s1, s2, s3, s4)  FOR_ALL_ROWS_IN_VECTOR { rowop_aaaaap   (ROW(dst), ROW(s1), ROW(s2), ROW(s3), ROW(s4)); }
+/* PUD COTS DDR4 primitives */
+#define ROWCLONE_VECTORS(dst, src)           FOR_ALL_ROWS_IN_VECTOR { rowop_rowclone  (ROW(dst), ROW(src)); }
+#define MRC_VECTORS(last, first)             FOR_ALL_ROWS_IN_VECTOR { rowop_mrc       (ROW(last), ROW(first)); }
+#define MAJ_VECTORS(last, first)             FOR_ALL_ROWS_IN_VECTOR { rowop_maj       (ROW(last), ROW(first)); }
+#define BULK_WRITE_VECTORS(last, first, d)   FOR_ALL_ROWS_IN_VECTOR { rowop_bulk_write(ROW(last), ROW(first), (d)); }
+#define NOT_XSUB_VECTORS(dst, src)           FOR_ALL_ROWS_IN_VECTOR { rowop_not_xsub  (ROW(dst), ROW(src)); }
+#define AND_XSUB_VECTORS(com, ref)           FOR_ALL_ROWS_IN_VECTOR { rowop_and_xsub  (ROW(com), ROW(ref)); }
+#define OR_XSUB_VECTORS(com, ref)            FOR_ALL_ROWS_IN_VECTOR { rowop_or_xsub   (ROW(com), ROW(ref)); }
+#define FRAC_VECTORS(dst)                    FOR_ALL_ROWS_IN_VECTOR { rowop_frac       (ROW(dst)); }
 
 static void *B_T0         = NULL;
 static void *B_T1         = NULL;

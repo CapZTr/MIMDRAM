@@ -209,7 +209,16 @@ class Request
         ROWCOPY,  // Inter-bank row copy: src1 addr -> dest addr (may differ in bank/rank)
         ROWANAP,
         ROWAAAP,
-        ROWAAAAAP
+        ROWAAAAAP,
+        // PUD primitives verified on COTS DDR4 (PULSAR / FCDRAM)
+        ROWCLONE,    // APA intra-subarray: ACT src → PRE(viol.tRP) → ACT dst → tRAS → PRE
+        MRC,         // Multi-Row Copy:     ACT rf → tRAS → PRE(viol.tRP) → ACT rl → tRAS → PRE
+        MAJ,         // Charge-sharing MAJ: ACT rf(viol.tRAS) → PRE(viol.tRP) → ACT rl → tRAS → PRE
+        BULK_WRITE,  // MAJ sequence → WRITE data via DQ bus to all N active rows
+        NOT_XSUB,    // Cross-subarray NOT: ACT src → tRAS → PRE(viol.tRP) → ACT dst → tRAS → PRE
+        AND_XSUB,    // Cross-subarray AND: init ref rows → APA(ref, com) → result in com rows
+        OR_XSUB,     // Cross-subarray OR:  init ref rows → APA(ref, com) → result in com rows
+        FRAC         // VDD/2 init: (ACT → PRE_viol) × frac_iters
     };
 
     struct RowOpPayload {
@@ -217,6 +226,7 @@ class Request
         Addr dest;
         Addr src1;
         Addr src2;
+        //uint64_t write_data;  // used by BULK_WRITE; zero for all other ops
     };
 
   private:

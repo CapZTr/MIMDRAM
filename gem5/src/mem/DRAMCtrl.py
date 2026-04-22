@@ -234,6 +234,11 @@ class DRAMCtrl(AbstractMemory):
     # sense-amplifier NOT operation latency (ANAP)
     tNOT = Param.Latency("Sense-amplifier NOT (inversion) latency")
 
+    # PUD (Processing-Using-DRAM) timing - violated tRAS/tRP for COTS DDR4 ops
+    pud_tRAS_violated = Param.Latency("Violated tRAS for PUD charge-sharing (< 3ns)")
+    pud_tRP_violated  = Param.Latency("Violated tRP for PUD decoder-state holding (< 3ns)")
+    pud_frac_iters    = Param.Int("Number of Frac iterations for VDD/2 initialisation")
+
     # Currently rolled into other params
     ######################################################################
 
@@ -378,6 +383,9 @@ class DDR3_1600_x64(DRAMCtrl):
     tWL = '32ns' # FIXME not actually used
     tWLOV = '4ns'
     tNOT = '35ns'
+    pud_tRAS_violated = '2ns'
+    pud_tRP_violated  = '2ns'
+    pud_frac_iters    = 4
 
     # <=85C, half for >85C
     tREFI = '7.8us'
@@ -592,6 +600,9 @@ class DDR4_2400_x64(DRAMCtrl):
     tWL = '32ns' # FIXME not actually used
     tWLOV = '4ns'
     tNOT = '35ns'
+    pud_tRAS_violated = '2ns'
+    pud_tRP_violated  = '2ns'
+    pud_frac_iters    = 4
 
     # Current values from datasheet
     IDD0 = '64mA'

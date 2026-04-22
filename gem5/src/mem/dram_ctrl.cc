@@ -85,6 +85,8 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     tCCD_L(p->tCCD_L), tRCD(p->tRCD), tCL(p->tCL), tRP(p->tRP), tRAS(p->tRAS),
     tWR(p->tWR), tRTP(p->tRTP), tRFC(p->tRFC), tREFI(p->tREFI), tRRD(p->tRRD),
     tRRD_L(p->tRRD_L), tXAW(p->tXAW), tWL(p->tWL), tWLOV(p->tWLOV), tNOT(p->tNOT),
+    pudTRAS_viol(p->pud_tRAS_violated), pudTRP_viol(p->pud_tRP_violated),
+    pudFracIters(p->pud_frac_iters),
     activationLimit(p->activation_limit), memSchedPolicy(p->mem_sched_policy),
     addrMapping(p->addr_mapping), pageMgmt(p->page_policy),
     maxAccessesPerRow(p->max_accesses_per_row),
@@ -528,26 +530,60 @@ DRAMCtrl::addToWriteQueue(PacketPtr pkt, unsigned int pktCount)
         dram_pkt->is_row_op = true;
         dram_pkt->row_op = addrs->op;
 
-        // ROWCOPY allows src and dst to reside in different banks/ranks
+        // ROWCOPY allows src and dst in different banks/ranks
         if (addrs->op == Request::ROWCOPY) {
             dram_pkt->src_rank = dram_pkt1->rank;
             dram_pkt->src_bank = dram_pkt1->bank;
             dram_pkt->src1_row = dram_pkt1->row;
+        // Cross-subarray ops: same bank, neighboring subarrays, valid N per tier
+        } else if (addrs->op == Request::NOT_XSUB ||
+                   addrs->op == Request::AND_XSUB ||
+                   addrs->op == Request::OR_XSUB) {
+            assert(dram_pkt->rank == dram_pkt1->rank);
+            assert(dram_pkt->bank == dram_pkt1->bank);
+            int sub_dst = dram_pkt->row  / rowsPerSubarray;
+            int sub_src = dram_pkt1->row / rowsPerSubarray;
+            assert(abs(sub_dst - sub_src) == 1);
+            // N rows activated per subarray depends on LWLD predecoder splits
+            int n_xsub = pudComputeN(dram_pkt1->row, dram_pkt->row, rowsPerSubarray);
+            assert(n_xsub >= 1 && n_xsub <= 16); // FCDRAM: max 16 per side
+            DPRINTF(DRAM, "Cross-subarray op: sub_src=%d sub_dst=%d N=%d rows/subarray\n",
+                    sub_src, sub_dst, n_xsub);
+            dram_pkt->src1_row = dram_pkt1->row;
+        // FRAC only needs the destination row
+        } else if (addrs->op == Request::FRAC) {
+            dram_pkt->src1_row = 0;
+            dram_pkt->src2_row = 0;
         } else {
-            // All other ops are strictly intra-bank
-            if (addrs->op != Request::ROWAP && addrs->op != Request::ROWANAP && addrs->op != Request::ROWAAAP && addrs->op != Request::ROWAAAAAP) {
+            // Intra-subarray ops: no-src ops skip rank/bank/subarray checks
+            bool no_src1 = (addrs->op == Request::ROWAP   ||
+                            addrs->op == Request::ROWANAP  ||
+                            addrs->op == Request::ROWAAAP  ||
+                            addrs->op == Request::ROWAAAAAP);
+            bool no_src2 = (no_src1 ||
+                            addrs->op == Request::ROWNOT   ||
+                            addrs->op == Request::ROWAAP   ||
+                            addrs->op == Request::ROWCLONE ||
+                            addrs->op == Request::MRC      ||
+                            addrs->op == Request::MAJ      ||
+                            addrs->op == Request::BULK_WRITE);
+            if (!no_src1) {
                 assert(dram_pkt->rank == dram_pkt1->rank);
                 assert(dram_pkt->bank == dram_pkt1->bank);
-                assert(dram_pkt->row / rowsPerSubarray == dram_pkt1->row / rowsPerSubarray);
+                assert(dram_pkt->row / rowsPerSubarray ==
+                       dram_pkt1->row / rowsPerSubarray);
             }
-            if (addrs->op != Request::ROWNOT && addrs->op != Request::ROWAAP && addrs->op != Request::ROWAP && addrs->op != Request::ROWANAP && addrs->op != Request::ROWAAAP && addrs->op != Request::ROWAAAAAP) {
+            if (!no_src2) {
                 assert(dram_pkt->rank == dram_pkt2->rank);
                 assert(dram_pkt->bank == dram_pkt2->bank);
-                assert(dram_pkt->row / rowsPerSubarray == dram_pkt2->row / rowsPerSubarray);
+                assert(dram_pkt->row / rowsPerSubarray ==
+                       dram_pkt2->row / rowsPerSubarray);
             }
             dram_pkt->src1_row = dram_pkt1->row;
             dram_pkt->src2_row = dram_pkt2->row;
         }
+        //TODO Adding write_data payload in Request creates a problem for LSQ
+        //dram_pkt->write_data = addrs->write_data;
         delete dram_pkt1;
         delete dram_pkt2;
 
@@ -1301,6 +1337,268 @@ DRAMCtrl::aaaaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
     prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
 }
 
+// ---------------------------------------------------------------------------
+// PUD bank functions — COTS DDR4 APA-based primitives
+// ---------------------------------------------------------------------------
+
+// Compute the number of rows simultaneously activated by an APA sequence.
+//
+// The LWLD has 5 predecoder tiers that decode the lower 9 bits of the
+// within-subarray row address (valid for rowsPerSubarray == 512):
+//   A: bit  0      (1 bit,  2 outputs)
+//   B: bits 2:1    (2 bits, 4 outputs)
+//   C: bits 4:3    (2 bits, 4 outputs)
+//   D: bits 6:5    (2 bits, 4 outputs)
+//   E: bits 8:7    (2 bits, 4 outputs)
+//
+// A tier contributes a factor of 2 to N whenever the two row addresses
+// latch different outputs for that tier.  N = 2^(number of split tiers).
+//
+// For intra-subarray (MRC/MAJ): pass the two within-subarray offsets.
+// For cross-subarray (NOT/AND/OR _XSUB): pass the within-subarray offsets
+// of R_first and R_last; GWLD difference (the subarray index bit) is handled
+// separately and does not feed into this calculation.
+int
+DRAMCtrl::pudComputeN(uint32_t row_first, uint32_t row_last, int rowsPerSubarray)
+{
+    uint32_t f = row_first % (uint32_t)rowsPerSubarray;
+    uint32_t l = row_last  % (uint32_t)rowsPerSubarray;
+    // Bit masks for each of the 5 predecoder tiers
+    static const uint32_t pred_masks[5] = { 0x001, 0x006, 0x018, 0x060, 0x180 };
+    int splits = 0;
+    for (int i = 0; i < 5; i++)
+        if ((f & pred_masks[i]) != (l & pred_masks[i])) splits++;
+    return 1 << splits;
+}
+
+// Shared helper: enforce tRRD and tXAW for one ACT at act_tick.
+// Used by all PUD functions so only the first ACT counts toward the window.
+void
+DRAMCtrl::pudEnforceActConstraints(DRAMCtrl::Rank& rank_ref, DRAMCtrl::Bank& bank_ref,
+                         Tick act_tick, int banksPerRank,
+                         bool bankGroupArch, Tick tRRD, Tick tRRD_L, Tick tXAW)
+{
+    for (int i = 0; i < banksPerRank; i++) {
+        if (bankGroupArch && bank_ref.bankgr == rank_ref.banks[i].bankgr)
+            rank_ref.banks[i].actAllowedAt =
+                std::max(act_tick + tRRD_L, rank_ref.banks[i].actAllowedAt);
+        else
+            rank_ref.banks[i].actAllowedAt =
+                std::max(act_tick + tRRD, rank_ref.banks[i].actAllowedAt);
+    }
+    if (!rank_ref.actTicks.empty()) {
+        rank_ref.actTicks.pop_back();
+        rank_ref.actTicks.push_front(act_tick);
+        Tick new_limit = rank_ref.actTicks.back() + tXAW;
+        if (rank_ref.actTicks.back() && act_tick < new_limit)
+            for (int j = 0; j < banksPerRank; j++)
+                rank_ref.banks[j].actAllowedAt =
+                    std::max(new_limit, rank_ref.banks[j].actAllowedAt);
+    }
+}
+
+void
+DRAMCtrl::rowcloneBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_src, uint32_t row_dst)
+{
+    // RowClone (COTS): ACT src → PRE(viol.tRP) → ACT dst → tRAS → PRE
+    DPRINTF(DRAM, "ROWCLONE rank %d bank %d src_row %d dst_row %d at tick %d\n",
+            rank_ref.rank, bank_ref.bank, row_src, row_dst, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    // Timing: tRP_viol (PRE interrupt) + tRAS (second ACT to PRE)
+    bank_ref.preAllowedAt = act_tick + pudTRP_viol + tRAS;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::mrcBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_first, uint32_t row_last)
+{
+    // MRC: ACT rf → tRAS → PRE(viol.tRP) → ACT rl → tRAS → PRE
+    // N determined by LWLD predecoder splits between row_first and row_last
+    int n_mrc = pudComputeN(row_first, row_last, rowsPerSubarray);
+    assert(n_mrc >= 2 && n_mrc <= 32); // PULSAR: 2..32 rows
+    DPRINTF(DRAM, "MRC rank %d bank %d rows %d..%d N=%d at tick %d\n",
+            rank_ref.rank, bank_ref.bank, row_first, row_last, n_mrc, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    // tRAS (first ACT fully latches) + tRP_viol + tRAS (second ACT)
+    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::majBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_first, uint32_t row_last)
+{
+    // MAJ/charge-sharing: ACT rf(viol.tRAS) → PRE(viol.tRP) → ACT rl → tRAS → PRE
+    int n_maj = pudComputeN(row_first, row_last, rowsPerSubarray);
+    assert(n_maj >= 4 && n_maj <= 32); // PULSAR MAJ: minimum 4 rows for MAJ3
+    DPRINTF(DRAM, "MAJ rank %d bank %d rows %d..%d N=%d at tick %d\n",
+            rank_ref.rank, bank_ref.bank, row_first, row_last, n_maj, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    // First ACT uses violated tRAS; second ACT uses full tRAS
+    bank_ref.preAllowedAt = act_tick + pudTRAS_viol + pudTRP_viol + tRAS;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::bulkWriteBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_first, uint32_t row_last)
+{
+    // BULK_WRITE: MAJ sequence + one WRITE burst to all N active rows
+    int n_bw = pudComputeN(row_first, row_last, rowsPerSubarray);
+    assert(n_bw >= 2 && n_bw <= 32);
+    DPRINTF(DRAM, "BULK_WRITE rank %d bank %d rows %d..%d N=%d at tick %d\n",
+            rank_ref.rank, bank_ref.bank, row_first, row_last, n_bw, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    // MAJ timing + one write burst (tBURST) before precharge
+    bank_ref.preAllowedAt = act_tick + pudTRAS_viol + pudTRP_viol + tRAS + tBURST;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::notXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_src, uint32_t row_dst)
+{
+    // NOT cross-subarray: ACT src → tRAS → PRE(viol.tRP) → ACT dst → tRAS → PRE
+    // Neighboring subarrays share sense amplifiers (open-bitline); dst gets ~src
+    DPRINTF(DRAM, "NOT_XSUB rank %d bank %d src_sub %d dst_sub %d at tick %d\n",
+            rank_ref.rank, bank_ref.bank,
+            row_src / rowsPerSubarray, row_dst / rowsPerSubarray, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::andXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_ref, uint32_t row_com)
+{
+    // AND cross-subarray: APA(ref, com) → result in com rows
+    // Reference subarray pre-initialised with VDD (for AND threshold)
+    DPRINTF(DRAM, "AND_XSUB rank %d bank %d ref_sub %d com_sub %d at tick %d\n",
+            rank_ref.rank, bank_ref.bank,
+            row_ref / rowsPerSubarray, row_com / rowsPerSubarray, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::orXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_ref, uint32_t row_com)
+{
+    // OR cross-subarray: APA(ref, com) → result in com rows
+    // Reference subarray pre-initialised with GND (for OR threshold)
+    DPRINTF(DRAM, "OR_XSUB rank %d bank %d ref_sub %d com_sub %d at tick %d\n",
+            rank_ref.rank, bank_ref.bank,
+            row_ref / rowsPerSubarray, row_com / rowsPerSubarray, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
+DRAMCtrl::fracBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row)
+{
+    // Frac: (ACT → PRE_viol) × pudFracIters  — drives cell to VDD/2
+    // Back-to-back interrupted activations; no SA enable each iteration
+    DPRINTF(DRAM, "FRAC rank %d bank %d row %d iters %d at tick %d\n",
+            rank_ref.rank, bank_ref.bank, row, pudFracIters, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    // Each iteration: pudTRAS_viol + tRP (normal precharge)
+    bank_ref.preAllowedAt = act_tick + (Tick)pudFracIters * (pudTRAS_viol + tRP);
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
 void
 DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
 {
@@ -1333,7 +1631,9 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
         static const char* rowOpNames[] = {
             "ROWAND", "ROWOR", "ROWNOT", "ROWXOR",
             "ROWAP", "ROWAAP", "ROWCOPY",
-            "ROWANAP", "ROWAAAP", "ROWAAAAAP"
+            "ROWANAP", "ROWAAAP", "ROWAAAAAP",
+            "ROWCLONE", "MRC", "MAJ", "BULK_WRITE",
+            "NOT_XSUB", "AND_XSUB", "OR_XSUB", "FRAC"
         };
         DPRINTF(DRAM, "RowOp %s rank %d bank %d dest_row %d src1_row %d src2_row %d\n",
                 rowOpNames[dram_pkt->row_op],
@@ -1380,6 +1680,31 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 break;
             case Request::ROWAAAAAP:
                 aaaaapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->src2_row, dram_pkt->row, dram_pkt->row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            // PUD COTS DDR4 primitives based on Pulsar and FCDRAM
+            case Request::ROWCLONE:
+                rowcloneBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::MRC: // Multi-Row Copy 
+                mrcBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::MAJ: 
+                majBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::BULK_WRITE:
+                bulkWriteBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::NOT_XSUB: // NOT across subarrays
+                notXsubBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::AND_XSUB:
+                andXsubBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::OR_XSUB:
+                orXsubBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::FRAC:
+                fracBank(rank, bank, cmd_at, dram_pkt->row); cmd_at = bank.actAllowedAt;
                 break;
             case Request::ROWCOPY: {
                 bool same_subarray =

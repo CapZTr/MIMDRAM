@@ -82,16 +82,22 @@ def template RowOpDecode {{
 
 def format RowOp() {{
 
+    # Ops with no src1 address (single-row or no-address ops)
+    _no_src1 = {'ROWAP', 'ROWANAP', 'ROWAAAP', 'ROWAAAAAP', 'FRAC'}
+    # Ops with no src2 address
+    _no_src2 = {'ROWNOT', 'ROWAP', 'ROWAAP', 'ROWCOPY','ROWANAP', 'ROWAAAP', 'ROWAAAAAP', 'ROWCLONE', 'MRC', 'MAJ', 'BULK_WRITE', 'NOT_XSUB', 'AND_XSUB', 'OR_XSUB', 'FRAC'}
+
     params = {
-        'dst': 'Rdi',
-        'src1': '0' if Name in {'ROWAP', 'ROWANAP', 'ROWAAAP', 'ROWAAAAAP'} else 'Rsi',
-        'src2': '0' if Name in {'ROWNOT', 'ROWAP', 'ROWAAP', 'ROWCOPY', 'ROWANAP', 'ROWAAAP', 'ROWAAAAAP'} else 'Rdx',
-        'mem_flags': 'Request::UNCACHEABLE | Request::ROWOP',
-        'op': Name,
-        'unused': 'Mem = 0'
+        'dst':        'Rdi',
+        'src1':       '0'   if Name in _no_src1 else 'Rsi',
+        'src2':       '0'   if Name in _no_src2 else 'Rdx',
+        'mem_flags':  'Request::UNCACHEABLE | Request::ROWOP',
+        'op':         Name,
+        'unused':     'Mem = 0'
     }
 
-    params['rowop_data'] = 'Request::RowOpPayload data = {Request::%(op)s, %(dst)s, %(src1)s, %(src2)s}'%params
+    params['rowop_data'] = ('Request::RowOpPayload data = '
+        '{Request::%(op)s, %(dst)s, %(src1)s, %(src2)s}') % params
     params['rowop_write'] = 'xc->writeMem((uint8_t*)&data, sizeof(data), 0, %(mem_flags)s, NULL)'%params
 
     iop = InstObjParams(name, Name, 'X86ISA::X86StaticInst', params)

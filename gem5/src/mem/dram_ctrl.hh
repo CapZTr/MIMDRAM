@@ -466,6 +466,7 @@ class DRAMCtrl : public AbstractMemory
         uint8_t  src_bank;  // Source bank for ROWCOPY (may differ from dst bank)
         bool is_row_op;
         Request::RowOp row_op;
+        uint64_t write_data;  // payload for BULK_WRITE
 
         /**
          * Bank id is calculated considering banks in all the ranks
@@ -502,7 +503,7 @@ class DRAMCtrl : public AbstractMemory
             : entryTime(curTick()), readyTime(curTick()),
               pkt(_pkt), isRead(is_read), rank(_rank), bank(_bank), row(_row),
               src1_row(0), src2_row(0), src_rank(0), src_bank(0),
-              is_row_op(false), bankId(bank_id),
+              is_row_op(false), write_data(0), bankId(bank_id),
               addr(_addr), size(_size), burstHelper(NULL), bankRef(bank_ref),
               rankRef(rank_ref)
         { }
@@ -699,6 +700,40 @@ class DRAMCtrl : public AbstractMemory
     void aaaaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
         uint32_t row2, uint32_t row3, uint32_t row4, uint32_t row5);
 
+    // PUD bank functions — COTS DDR4 APA-based primitives
+
+    /** Compute the number of rows simultaneously activated by an APA sequence. */
+    int pudComputeN(uint32_t row_first, uint32_t row_last, int rowsPerSubarray);
+
+    /** Shared helper: enforce tRRD and tXAW for one ACT at act_tick.  */
+    void pudEnforceActConstraints(DRAMCtrl::Rank& rank_ref, DRAMCtrl::Bank& bank_ref,
+                         Tick act_tick, int banksPerRank,
+                         bool bankGroupArch, Tick tRRD, Tick tRRD_L, Tick tXAW);
+
+    /** RowClone (COTS): ACT src → PRE(viol.tRP) → ACT dst → tRAS → PRE */
+    void rowcloneBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_src, uint32_t row_dst);
+    /** MRC: ACT rf → tRAS → PRE(viol.tRP) → ACT rl → tRAS → PRE */
+    void mrcBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_first, uint32_t row_last);
+    /** MAJ/charge-sharing: ACT rf(viol.tRAS) → PRE(viol.tRP) → ACT rl → tRAS → PRE */
+    void majBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_first, uint32_t row_last);
+    /** BULK_WRITE: MAJ sequence then WRITE write_data to all N active rows */
+    void bulkWriteBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_first, uint32_t row_last);
+    /** Cross-subarray NOT: ACT src → tRAS → PRE(viol.tRP) → ACT dst → tRAS → PRE */
+    void notXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_src, uint32_t row_dst);
+    /** Cross-subarray AND: APA(ref, com) → result in com rows */
+    void andXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_ref, uint32_t row_com);
+    /** Cross-subarray OR: APA(ref, com) → result in com rows */
+    void orXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_ref, uint32_t row_com);
+    /** Frac (VDD/2 init): (ACT → PRE_viol) × pudFracIters */
+    void fracBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row);
+
     /**
      * Used for debugging to observe the contents of the queues.
      */
@@ -797,6 +832,10 @@ class DRAMCtrl : public AbstractMemory
     const Tick tWL;
     const Tick tWLOV;
     const Tick tNOT;
+    // PUD violated timings (COTS DDR4)
+    const Tick pudTRAS_viol;
+    const Tick pudTRP_viol;
+    const int  pudFracIters;
     const uint32_t activationLimit;
 
     /**

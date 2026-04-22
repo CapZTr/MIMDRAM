@@ -238,6 +238,15 @@
                     0x63: RowOp::ROWANAP();
                     0x64: RowOp::ROWAAAP();
                     0x65: RowOp::ROWAAAAAP();
+                    // PUD COTS DDR4 primitives (PULSAR / FCDRAM)
+                    0x66: RowOp::ROWCLONE();
+                    0x67: RowOp::MRC();
+                    0x68: RowOp::MAJ();
+                    0x69: RowOp::BULK_WRITE();
+                    0x6a: RowOp::NOT_XSUB();
+                    0x6b: RowOp::AND_XSUB();
+                    0x6c: RowOp::OR_XSUB();
+                    0x6d: RowOp::FRAC();
                     default: Inst::UD2();
                 }
             }
