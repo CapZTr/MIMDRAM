@@ -44,12 +44,14 @@
  */
 
 #include "base/bitfield.hh"
+#include "base/callback.hh"
 #include "base/trace.hh"
 #include "debug/DRAM.hh"
 #include "debug/DRAMPower.hh"
 #include "debug/DRAMState.hh"
 #include "debug/Drain.hh"
 #include "mem/dram_ctrl.hh"
+#include "sim/sim_exit.hh"
 #include "sim/system.hh"
 
 using namespace std;
@@ -61,6 +63,7 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     retryRdReq(false), retryWrReq(false),
     busState(READ),
     pendingRowOps(0),
+    firstRowOpPrinted(false), lastRowOpPrinted(false), lastRowOpTick(0),
     nextReqEvent(this), respondEvent(this),
     deviceSize(p->device_size),
     deviceBusWidth(p->device_bus_width), burstLength(p->burst_length),
@@ -1668,18 +1671,28 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 break;
             case Request::ROWAP:
                 apBank (rank, bank, cmd_at, Bank::B_T0_T1_T2); cmd_at = bank.actAllowedAt;		//TODO replace Bank::B_T0_T1_T2 with correct bank
+                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAP (first)" << std::endl; firstRowOpPrinted = true; }
+                lastRowOpTick = curTick();
 		        break;
             case Request::ROWAAP:
                 aapBank(rank, bank, cmd_at, 0, 0, true); cmd_at = bank.actAllowedAt;	//TODO replace NULLs with correct banks
+                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAAP (first)" << std::endl; firstRowOpPrinted = true; }
+                lastRowOpTick = curTick();
                 break;
             case Request::ROWANAP:
                 anapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWANAP (first)" << std::endl; firstRowOpPrinted = true; }
+                lastRowOpTick = curTick();
                 break;
             case Request::ROWAAAP:
                 aaapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->src2_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAAAP (first)" << std::endl; firstRowOpPrinted = true; }
+                lastRowOpTick = curTick();
                 break;
             case Request::ROWAAAAAP:
                 aaaaapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->src2_row, dram_pkt->row, dram_pkt->row, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAAAAAP (first)" << std::endl; firstRowOpPrinted = true; }
+                lastRowOpTick = curTick();
                 break;
             // PUD COTS DDR4 primitives based on Pulsar and FCDRAM
             case Request::ROWCLONE:
@@ -1791,6 +1804,8 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                             dram_pkt->rank, dram_pkt->bank, dram_pkt->row,
                             rd_col_at, wr_col_at);
                 }
+                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWCOPY (first)" << std::endl; firstRowOpPrinted = true; }
+                lastRowOpTick = curTick();
                 break;
             }
             default:
@@ -2909,6 +2924,17 @@ DRAMCtrl::regStats()
 
     pageHitRate = (writeRowHits + readRowHits) /
         (writeBursts - mergedWrBursts + readBursts - servicedByWrQ) * 100;
+
+    registerExitCallback(new MakeCallback<DRAMCtrl, &DRAMCtrl::printLastRowOp>(this));
+}
+
+void
+DRAMCtrl::printLastRowOp()
+{
+    if (firstRowOpPrinted && !lastRowOpPrinted) {
+        std::cout << lastRowOpTick << "     ROWOP (last)" << std::endl;
+        lastRowOpPrinted = true;
+    }
 }
 
 void

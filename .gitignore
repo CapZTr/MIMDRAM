@@ -4,6 +4,9 @@
 *.out
 *.patch
 *.pyc
+*.done
 *parsetab.py
 */build/
 */m5out/
+results/
+traces/

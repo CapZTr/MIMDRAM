@@ -147,6 +147,10 @@ class DRAMCtrl : public AbstractMemory
     BusState busState;
 
     int pendingRowOps;
+    bool firstRowOpPrinted;
+    bool lastRowOpPrinted;
+    Tick lastRowOpTick;
+    void printLastRowOp();
 
     /**
      * A basic class to track the bank state, i.e. what row is

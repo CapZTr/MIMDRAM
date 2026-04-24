@@ -520,17 +520,20 @@ int main(int argc, char *argv[]) {
     /* Two iterations: first is warmup, second is the measured run.
      * m5_reset_stats at the top of each iteration ensures only the
      * last iteration's stats are captured by m5_dump_stats. */
-    for (int iter = 0; iter < 2; iter++) {
-        m5_reset_stats(0, 0);
+    // for (int iter = 0; iter < 2; iter++) {
+    //     m5_reset_stats(0, 0);
  
-        if (g_verbose >= 1)
-            printf("=== %s (iter %d) ===\n",
-                   iter == 0 ? "Warmup     " : "Measurement", iter);
+    //     printf("=== %s (iter %d) ===\n",
+    //             iter == 0 ? "Warmup     " : "Measurement", iter);
  
-        if (execute_trace_once(argv[1]) != 0) return 1;
+    //     if (execute_trace_once(argv[1]) != 0) return 1;
  
-        if (g_verbose >= 1) printf("\n");
-    }
+    //     if (g_verbose >= 1) printf("\n");
+    // }
+
+    m5_reset_stats(0, 0);
+
+    if (execute_trace_once(argv[1]) != 0) return 1;
  
     m5_dump_stats(0, 0);
  
