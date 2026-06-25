@@ -700,11 +700,11 @@ class DRAMCtrl : public AbstractMemory
     void anapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
         uint32_t row2);
 
-    /** ACT×5 + PRE: 5ns between each ACT, PRE after tRAS + 4*tWLOV. */
+    /** ACTx5 + PRE: 5ns between each ACT, PRE after tRAS + 4*tWLOV. */
     void aaaaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row1,
         uint32_t row2, uint32_t row3, uint32_t row4, uint32_t row5);
 
-    // PUD bank functions — COTS DDR4 APA-based primitives
+    // PUD bank functions - COTS DDR4 APA-based primitives
 
     /** Compute the number of rows simultaneously activated by an APA sequence. */
     int pudComputeN(uint32_t row_first, uint32_t row_last, int rowsPerSubarray);
@@ -735,7 +735,7 @@ class DRAMCtrl : public AbstractMemory
     /** Cross-subarray OR: APA(ref, com) → result in com rows */
     void orXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
         uint32_t row_ref, uint32_t row_com);
-    /** Frac (VDD/2 init): (ACT → PRE_viol) × pudFracIters */
+    /** Frac (VDD/2 init): (ACT → PRE_viol) x pudFracIters */
     void fracBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row);
 
     /**

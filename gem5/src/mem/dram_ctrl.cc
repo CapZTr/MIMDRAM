@@ -1295,7 +1295,7 @@ void
 DRAMCtrl::aaaaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
         uint32_t row1, uint32_t row2, uint32_t row3, uint32_t row4, uint32_t row5)
 {
-    DPRINTF(DRAM, "Activate×5-Precharge at tick %d\n", act_tick);
+    DPRINTF(DRAM, "Activatex5-Precharge at tick %d\n", act_tick);
 
     assert(bank_ref.openRow == Bank::NO_ROW);
     bank_ref.openRow = Bank::DOUBLE_ROW;
@@ -1341,7 +1341,7 @@ DRAMCtrl::aaaaapBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
 }
 
 // ---------------------------------------------------------------------------
-// PUD bank functions — COTS DDR4 APA-based primitives
+// PUD bank functions - COTS DDR4 APA-based primitives
 // ---------------------------------------------------------------------------
 
 // Compute the number of rows simultaneously activated by an APA sequence.
@@ -1581,7 +1581,7 @@ DRAMCtrl::orXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
 void
 DRAMCtrl::fracBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick, uint32_t row)
 {
-    // Frac: (ACT → PRE_viol) × pudFracIters  — drives cell to VDD/2
+    // Frac: (ACT → PRE_viol) x pudFracIters  - drives cell to VDD/2
     // Back-to-back interrupted activations; no SA enable each iteration
     DPRINTF(DRAM, "FRAC rank %d bank %d row %d iters %d at tick %d\n",
             rank_ref.rank, bank_ref.bank, row, pudFracIters, act_tick);

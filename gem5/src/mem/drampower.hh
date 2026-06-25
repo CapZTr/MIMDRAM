@@ -47,6 +47,7 @@
 
 #include "libdrampower/LibDRAMPower.h"
 #include "params/DRAMCtrl.hh"
+#include "params/DRAMInterface.hh"
 
 /**
  * DRAMPower is a standalone tool which calculates the power consumed by a
@@ -96,6 +97,7 @@ class DRAMPower
     libDRAMPower powerlib;
 
     DRAMPower(const DRAMCtrlParams* p, bool include_io);
+    DRAMPower(const DRAMInterfaceParams* p, bool include_io);
 
 };
 

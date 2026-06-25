@@ -226,18 +226,18 @@ class DRAMCtrl(AbstractMemory):
     tXSDLL = Param.Latency("0ns", "Self-refresh exit latency DLL")
 
     # time between two activates in basic AAP
-    tWL = Param.Latency("Word-line delay")
+    tWL = Param.Latency('32ns', "Word-line delay")
 
     # time between two activates in overlapped AAP
-    tWLOV = Param.Latency("Word-line delay (overlapped activate)")
+    tWLOV = Param.Latency('5ns', "Word-line delay (overlapped activate)")
 
     # sense-amplifier NOT operation latency (ANAP)
-    tNOT = Param.Latency("Sense-amplifier NOT (inversion) latency")
+    tNOT = Param.Latency('15ns', "Sense-amplifier NOT (inversion) latency")
 
     # PUD (Processing-Using-DRAM) timing - violated tRAS/tRP for COTS DDR4 ops
-    pud_tRAS_violated = Param.Latency("Violated tRAS for PUD charge-sharing (< 3ns)")
-    pud_tRP_violated  = Param.Latency("Violated tRP for PUD decoder-state holding (< 3ns)")
-    pud_frac_iters    = Param.Int("Number of Frac iterations for VDD/2 initialisation")
+    pud_tRAS_violated = Param.Latency('1ns', "Violated tRAS for PUD charge-sharing (< 3ns)")
+    pud_tRP_violated  = Param.Latency('1ns', "Violated tRP for PUD decoder-state holding (< 3ns)")
+    pud_frac_iters    = Param.Int(10, "Number of Frac iterations for VDD/2 initialisation")
 
     # Currently rolled into other params
     ######################################################################
@@ -1070,3 +1070,174 @@ class HBM_1000_4H_x64(HBM_1000_4H_x128):
     # Default different rank bus delay to 2 CK, @1000 MHz = 2 ns
     tCS = '2ns'
     tREFI = '3.9us'
+
+# ==================================================================
+# HBM 2.0 pseudo-channel (64-bit bus per pseudo-channel)
+# Source: ETHZ-DYNAMO OptiPIM HBM2.cpp (commit 9be8f9a)
+#
+# tCK = 1 ns (1000 MHz core, 2000 MT/s DDR)
+# 4 bank groups x 2 banks/group = 8 banks per pseudo-channel (JESD235B HBM2)
+# 1 kB row buffer per pseudo-channel
+#
+# Three density variants differ only in device_size and tRFC:
+#   HBM2_2Gb_x64  2 Gb die -> 128 MB per PC   tRFC = 160 ns
+#   HBM2_4Gb_x64  4 Gb die -> 256 MB per PC   tRFC = 260 ns
+#   HBM2_8Gb_x64  8 Gb die -> 512 MB per PC   tRFC = 350 ns
+# ==================================================================
+
+class HBM2_2Gb_x64(DRAMCtrl):
+    # Geometry
+    device_bus_width      = 64
+    burst_length          = 4
+    device_size           = '128MB'    # 2 Gb / 2 pseudo-channels
+    device_rowbuffer_size = '1kB'
+    devices_per_rank      = 1
+    ranks_per_channel     = 1
+    bank_groups_per_rank  = 4
+    banks_per_rank        = 8          # 4 BG x 2 banks/BG (JESD235B HBM2)
+
+    # Clock: 1000 MHz / 2000 MT/s -> tCK = 1 ns
+    tCK    = '1ns'
+
+    # Burst: BL4 DDR -> 4 x 0.5 tCK = 2 ns
+    tBURST = '2ns'
+
+    # Core timing (OptiPIM cycles x tCK)
+    tCL    = '7ns'    # nCL    = 7
+    tRCD   = '7ns'    # nRCDRD = 7
+    tRP    = '7ns'    # nRP    = 7
+    tRAS   = '17ns'   # nRAS   = 17
+    tWR    = '8ns'    # nWR    = 8
+    tRTP   = '2ns'    # nRTPS  = 2
+
+    # Bus turnaround
+    tWTR   = '3ns'    # nWTRS  = 3
+    tRTW   = '3ns'    # nRTW   = 3
+    tCS    = '1ns'
+
+    # CAS-to-CAS (bank group)
+    # gem5 requires tCCD_L > tBURST; JEDEC HBM2 min is 4 tCK but
+    # OptiPIM nCCDL=2 equals tBURST, so bump to 3 ns to satisfy constraint.
+    tCCD_L = '3ns'    # nCCDL >= 3 (gem5 constraint: > tBURST=2ns)
+
+    # ACT-to-ACT
+    tRRD   = '2ns'    # nRRDS  = 2  (different bank group)
+    tRRD_L = '3ns'    # nRRDL  = 3  (same bank group)
+
+    # Four-activation window
+    tXAW   = '15ns'   # nFAW   = 15
+    activation_limit = 4
+
+    # Refresh: 2 Gb die
+    tRFC   = '160ns'
+    tREFI  = '3900ns'  # nREFI  = 3900 cycles
+
+    # Exit timings (HBM has no power-down mode; set to 0)
+    tXP    = '0ns'
+    tXPDLL = '0ns'
+    tXS    = '160ns'   # = tRFC
+
+    addr_mapping = 'RoRaBaChCo'
+    page_policy  = 'close'
+
+    # Power (HBM2 placeholder values; no official JEDEC IDD spec)
+    VDD    = '1.2V'
+    IDD0   = '60mA'
+    IDD02  = '0mA'
+    IDD2N  = '26mA'
+    IDD2N2 = '0mA'
+    IDD3N  = '34mA'
+    IDD3N2 = '0mA'
+    IDD4W  = '123mA'
+    IDD4W2 = '0mA'
+    IDD4R  = '123mA'
+    IDD4R2 = '0mA'
+    IDD5   = '215mA'
+    IDD52  = '0mA'
+    IDD6   = '12mA'
+    IDD62  = '0mA'
+    IDD2P0 = '6mA'
+    IDD2P02= '0mA'
+    IDD2P1 = '12mA'
+    IDD2P12= '0mA'
+    IDD3P0 = '8mA'
+    IDD3P02= '0mA'
+    IDD3P1 = '20mA'
+    IDD3P12= '0mA'
+
+
+class HBM2_4Gb_x64(HBM2_2Gb_x64):
+    device_size = '256MB'
+    tRFC        = '260ns'
+    tXS         = '260ns'
+
+
+class HBM2_8Gb_x64(HBM2_2Gb_x64):
+    device_size = '512MB'
+    tRFC        = '350ns'
+    tXS         = '350ns'
+
+
+# ==================================================================
+# HBM 3.0 pseudo-channel (64-bit bus per pseudo-channel)
+# Source: ETHZ-DYNAMO OptiPIM HBM3.cpp (commit 9be8f9a)
+#
+# Key architectural change vs HBM2:
+#   4 bank groups x 4 banks/group = 16 banks per PC
+#   (HBM2 has 4 BG x 2 banks = 8 banks per PC)
+#
+# Timings: identical to HBM2 per OptiPIM (authors acknowledge TODO).
+# Real HBM3 silicon (e.g. SK Hynix at 6.4 Gbps) has substantially
+# different timings; this preset matches the OptiPIM simulation model.
+#
+# RFM (Refresh Management / rowhammer mitigation) commands are new
+# in HBM3 (RFMab, RFMsb) but are not supported in this gem5 version.
+#
+# Density variants (same die capacity as HBM2, more banks per PC):
+#   HBM3_2Gb_x64  2 Gb die -> 128 MB per PC   tRFC = 160 ns
+#   HBM3_4Gb_x64  4 Gb die -> 256 MB per PC   tRFC = 260 ns
+#   HBM3_8Gb_x64  8 Gb die -> 512 MB per PC   tRFC = 350 ns
+# ==================================================================
+
+class HBM3_2Gb_x64(HBM2_2Gb_x64):
+    """HBM 3.0 pseudo-channel, 2 Gb die. 4 BG x 4 banks = 16 banks/PC."""
+    # Double banks per BG relative to HBM2 (4 instead of 2)
+    banks_per_rank = 16    # 4 BG x 4 banks/BG (JESD238 HBM3)
+    # device_size stays 128 MB; gem5 computes rows = 128MB/(16*1kB) = 8192 rows/bank
+
+
+class HBM3_4Gb_x64(HBM3_2Gb_x64):
+    device_size = '256MB'
+    tRFC        = '260ns'
+    tXS         = '260ns'
+
+
+class HBM3_8Gb_x64(HBM3_2Gb_x64):
+    device_size = '512MB'
+    tRFC        = '350ns'
+    tXS         = '350ns'
+
+
+# ------------------------------------------------------------------
+# Streaming-bandwidth variants: open-adaptive page policy + FAW off.
+# These are NOT realistic DRAM configurations -- they exist purely to
+# measure the peak bus bandwidth without the FAW bottleneck.
+#
+# Use with sweep.py or bw_stream.py to see the theoretical bus limit:
+#   bus_bw = burst_size / tBURST = 32 B / 2 ns = 16 GB/s
+#
+# activation_limit = 0 disables the four-activation window (FAW)
+# check in dram_ctrl.cc so ACTs are never artificially delayed.
+# page_policy = 'open_adaptive' keeps rows open between accesses,
+# converting all same-row accesses to CAS-only (no ACT, no tRCD).
+# ------------------------------------------------------------------
+class HBM3_4Gb_x64_stream(HBM3_4Gb_x64):
+    """HBM3 4 Gb -- open-adaptive + no FAW -- peak bus BW measurement."""
+    page_policy      = 'open_adaptive'
+    activation_limit = 0    # disable FAW
+
+
+class HBM2_4Gb_x64_stream(HBM2_4Gb_x64):
+    """HBM2 4 Gb -- open-adaptive + no FAW -- peak bus BW measurement."""
+    page_policy      = 'open_adaptive'
+    activation_limit = 0    # disable FAW
