@@ -12,7 +12,17 @@
 #include "sim/system.hh"
 
 // ---------------------------------------------------------------------------
-// On-disk trace structures (must match 93_simdram_schedule_runner.c)
+// On-disk trace structures.
+//
+// Two binary formats exist, distinguished by TraceHeader::record_size:
+//
+//   record_size == 32  ->  32-bank format  (93_simdram_schedule_runner.c)
+//                          banks field: uint32_t (bits 0..31)
+//
+//   record_size == 48  ->  128-bank format (94_simdram_schedule_runner_hbm.c)
+//                          banks field: uint64_t[2] (bits 0..127)
+//
+// After reading, both are normalised into NormRecord for uniform processing.
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -25,18 +35,43 @@ struct TraceHeader {
 };
 static_assert(sizeof(TraceHeader) == 32, "TraceHeader size mismatch");
 
-struct TraceRecord {
+// 32-bank on-disk record (record_size == 32)
+struct TraceRecord32 {
     int64_t  start;
     int64_t  end;
-    uint32_t banks;    // bitmask of active banks (bit b → bank index b)
+    uint32_t banks;
     uint16_t lhs_bw;
     uint16_t rhs_bw;
-    uint8_t  kind;     // OP_MULI=0, OP_ADDI=1, OP_ROW_COPY=2
-    uint8_t  src;      // source bank (ROW_COPY only)
-    uint8_t  dst;      // destination bank (ROW_COPY only)
+    uint8_t  kind;
+    uint8_t  src;
+    uint8_t  dst;
     uint8_t  pad[5];
 };
-static_assert(sizeof(TraceRecord) == 32, "TraceRecord size mismatch");
+static_assert(sizeof(TraceRecord32) == 32, "TraceRecord32 size mismatch");
+
+// 128-bank on-disk record (record_size == 48)
+struct TraceRecord128 {
+    int64_t  start;
+    int64_t  end;
+    uint64_t banks[2];   // banks[b>>6] bit (b&63) = bank b active
+    uint16_t lhs_bw;
+    uint16_t rhs_bw;
+    uint8_t  kind;
+    uint8_t  src;
+    uint8_t  dst;
+    uint8_t  pad[9];
+};
+static_assert(sizeof(TraceRecord128) == 48, "TraceRecord128 size mismatch");
+
+// Normalised record used internally after reading either format.
+struct NormRecord {
+    uint64_t banks[2];
+    int      lhs_bw;
+    int      rhs_bw;
+    uint8_t  kind;
+    uint8_t  src;
+    uint8_t  dst;
+};
 
 enum OpKind : uint8_t { OP_MULI = 0, OP_ADDI = 1, OP_ROW_COPY = 2 };
 
@@ -53,6 +88,7 @@ RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
       baseAddr(p->base_addr),
       banksPerChannel(p->banks_per_channel),
       channelSize(p->channel_size),
+      rowStride(p->row_stride),
       masterID(p->system->getMasterId(name())),
       currentOp(0),
       waitingResp(false),
@@ -118,7 +154,7 @@ RowOpTracePlayer::slotAddr(int slot, int global_bank) const
     int local_bank = global_bank % banksPerChannel;
     return baseAddr
          + (Addr)channel * channelSize
-         + ((Addr)slot * banksPerChannel + local_bank) * (Addr)ROW_SIZE;
+         + ((Addr)slot * banksPerChannel + local_bank) * rowStride;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,32 +365,64 @@ RowOpTracePlayer::loadTrace()
     TraceHeader hdr;
     if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
         memcmp(hdr.magic, "CIMTRACE", 8) != 0 ||
-        hdr.version != 1 ||
-        hdr.record_size != sizeof(TraceRecord))
+        hdr.version != 1)
         panic("RowOpTracePlayer: invalid trace header in '%s'", traceFile.c_str());
 
-    // --- Pass 1: find max widths ---
+    // Detect format from record_size; derive total bank count.
+    int total_banks;
+    if (hdr.record_size == sizeof(TraceRecord32)) {
+        total_banks = 32;
+    } else if (hdr.record_size == sizeof(TraceRecord128)) {
+        total_banks = 128;
+    } else {
+        panic("RowOpTracePlayer: unrecognised record_size=%u in '%s' "
+              "(expected 32 or 48)", hdr.record_size, traceFile.c_str());
+    }
+
+    // --- Read and normalise all records in one pass ---
+    std::vector<NormRecord> records(hdr.num_records);
     int max_lhs = 0, max_rhs = 0, max_out = 0, max_partial = 0;
 
-    std::vector<TraceRecord> records(hdr.num_records);
     for (uint64_t i = 0; i < hdr.num_records; i++) {
-        if (fread(&records[i], sizeof(TraceRecord), 1, f) != 1)
-            panic("RowOpTracePlayer: truncated trace at record %llu",
-                  (unsigned long long)i);
+        NormRecord& nr = records[i];
+        if (total_banks == 32) {
+            TraceRecord32 raw;
+            if (fread(&raw, sizeof(raw), 1, f) != 1)
+                panic("RowOpTracePlayer: truncated trace at record %llu",
+                      (unsigned long long)i);
+            nr.banks[0] = raw.banks;
+            nr.banks[1] = 0;
+            nr.lhs_bw = raw.lhs_bw;
+            nr.rhs_bw = raw.rhs_bw;
+            nr.kind   = raw.kind;
+            nr.src    = raw.src;
+            nr.dst    = raw.dst;
+        } else {
+            TraceRecord128 raw;
+            if (fread(&raw, sizeof(raw), 1, f) != 1)
+                panic("RowOpTracePlayer: truncated trace at record %llu",
+                      (unsigned long long)i);
+            nr.banks[0] = raw.banks[0];
+            nr.banks[1] = raw.banks[1];
+            nr.lhs_bw = raw.lhs_bw;
+            nr.rhs_bw = raw.rhs_bw;
+            nr.kind   = raw.kind;
+            nr.src    = raw.src;
+            nr.dst    = raw.dst;
+        }
 
-        const TraceRecord& r = records[i];
-        if (r.kind == OP_MULI) {
-            max_lhs     = std::max(max_lhs, (int)r.lhs_bw);
-            max_rhs     = std::max(max_rhs, (int)r.rhs_bw);
-            max_out     = std::max(max_out, (int)r.lhs_bw + (int)r.rhs_bw);
-            max_partial = std::max(max_partial, (int)r.lhs_bw - 1);
-        } else if (r.kind == OP_ADDI) {
-            max_lhs = std::max(max_lhs, (int)r.lhs_bw);
-            max_rhs = std::max(max_rhs, (int)r.rhs_bw);
-            max_out = std::max(max_out, std::min((int)r.lhs_bw, (int)r.rhs_bw));
-        } else { // ROW_COPY
-            max_lhs = std::max(max_lhs, (int)r.lhs_bw);
-            max_out = std::max(max_out, (int)r.lhs_bw); // src is out[], dst is lhs[]
+        if (nr.kind == OP_MULI) {
+            max_lhs     = std::max(max_lhs, nr.lhs_bw);
+            max_rhs     = std::max(max_rhs, nr.rhs_bw);
+            max_out     = std::max(max_out, nr.lhs_bw + nr.rhs_bw);
+            max_partial = std::max(max_partial, nr.lhs_bw - 1);
+        } else if (nr.kind == OP_ADDI) {
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_rhs = std::max(max_rhs, nr.rhs_bw);
+            max_out = std::max(max_out, std::min(nr.lhs_bw, nr.rhs_bw));
+        } else { // ROW_COPY: src=out[], dst=lhs[]
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_out = std::max(max_out, nr.lhs_bw);
         }
     }
     fclose(f);
@@ -369,20 +437,20 @@ RowOpTracePlayer::loadTrace()
     carryBase   = tmpBase     + 1;
     int totalSlots = carryBase + 2;
 
-    inform("RowOpTracePlayer: %llu records, slots=%d (rows/bank), ops TBD",
-           (unsigned long long)hdr.num_records, totalSlots);
+    inform("RowOpTracePlayer: %llu records, format=%d-bank, slots=%d (rows/bank)",
+           (unsigned long long)hdr.num_records, total_banks, totalSlots);
 
     if (totalSlots >= 512)
         panic("RowOpTracePlayer: %d slots exceed rows_per_subarray (512)", totalSlots);
 
-    // --- Pass 2: expand records ---
+    // --- Expand records into PendingOps ---
     for (uint64_t i = 0; i < hdr.num_records; i++) {
-        const TraceRecord& r = records[i];
+        const NormRecord& r = records[i];
 
-        // Build global bank-index list from bitmask (always 32 global banks)
+        // Build global bank list from 128-bit bitmask.
         std::vector<int> banks;
-        for (int b = 0; b < TOTAL_BANKS; b++)
-            if (r.banks & (1u << b))
+        for (int b = 0; b < total_banks; b++)
+            if (r.banks[b >> 6] & (1ull << (b & 63)))
                 banks.push_back(b);
 
         switch (r.kind) {

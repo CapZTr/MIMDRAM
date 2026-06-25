@@ -1,17 +1,21 @@
 """
 trace_player.py  --  replay a CIMTRACE binary against a bare DRAMCtrl
 
-Supported memory types and how they map to 32 MIMDRAM global banks:
+Two CIMTRACE binary formats are supported, auto-detected from the header:
 
-  DDR4_2400_x64  : banks_per_rank=16 ranks=2 -> 32 banks/ch x 1 channel
-  HBM3_*_x64    : banks_per_rank=16 ranks=1 -> 16 banks/ch x 2 channels
-  HBM2_*_x64    : banks_per_rank=8  ranks=1 ->  8 banks/ch x 4 channels
+  record_size==32: 32-bank format  (93_simdram_schedule_runner.c)
+  record_size==48: 128-bank format (94_simdram_schedule_runner_hbm.c)
 
-For multi-channel configs the channels are given non-overlapping address
-ranges (no XOR-hashed interleaving).  The trace player maps
+Memory type to channel mapping:
 
-  global_bank in [0,32)  ->  channel    = global_bank / banks_per_channel
-                              local_bank = global_bank % banks_per_channel
+  32-bank traces:
+    DDR4_2400_x64 : 32 banks/ch x 1 channel
+    HBM3_*_x64   : 16 banks/ch x 2 channels
+    HBM2_*_x64   :  8 banks/ch x 4 channels
+
+  128-bank traces:
+    HBM3_*_x64   : 16 banks/ch x 8 channels
+    HBM2_*_x64   :  8 banks/ch x 16 channels
 
 Usage:
   gem5.opt configs/dram/trace_player.py --trace=microworkloads/trace.bin
@@ -21,6 +25,7 @@ Usage:
 
 import math
 import optparse
+import struct
 import sys
 import re
 
@@ -34,7 +39,6 @@ import MemConfig
 # ---------------------------------------------------------------------------
 # Constants (must match mimdram.h and request.hh)
 # ---------------------------------------------------------------------------
-TOTAL_BANKS       = 32      # BANK_COUNT(16) * RANK_COUNT(2)
 ROWS_PER_SUBARRAY = 512     # rows_per_subarray from mimdram.h
 ROW_SIZE_BYTES    = 8192    # #define ROW_SIZE in request.hh
 
@@ -51,7 +55,8 @@ parser.add_option("--mem-type", type="choice",
                   default="DDR4_2400_x64",
                   choices=MemConfig.mem_names(),
                   help="DRAM type (default: DDR4_2400_x64). "
-                       "banks_per_rank * ranks_per_channel must divide 32.")
+                       "banks_per_rank * ranks_per_channel must divide "
+                       "the trace total_banks (32 or 128).")
 
 parser.add_option("--addr-map", type="string", default="",
                   help="Override addr_mapping (e.g. RoRaBaCoCh, RoRaBaChCo). "
@@ -67,6 +72,32 @@ if args:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
+# Auto-detect total bank count from the trace header.
+#   record_size == 32  ->  32-bank format  (uint32_t banks bitmask)
+#   record_size == 48  ->  128-bank format (uint64_t banks[2] bitmask)
+# ---------------------------------------------------------------------------
+
+try:
+    with open(options.trace, 'rb') as _tf:
+        _hdr = _tf.read(32)
+except IOError as e:
+    print "Error: cannot open trace file '%s': %s" % (options.trace, e)
+    sys.exit(1)
+
+if len(_hdr) < 32 or _hdr[:8] != 'CIMTRACE':
+    print "Error: '%s' is not a valid CIMTRACE file" % options.trace
+    sys.exit(1)
+
+_record_size = struct.unpack_from('<I', _hdr, 12)[0]
+if _record_size == 32:
+    total_banks = 32
+elif _record_size == 48:
+    total_banks = 128
+else:
+    print "Error: unrecognised record_size=%d in '%s'" % (_record_size, options.trace)
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
 # Memory geometry
 # ---------------------------------------------------------------------------
 
@@ -76,19 +107,29 @@ tmp     = mem_cls()
 banks_per_channel = int(tmp.banks_per_rank.value) * \
                     int(tmp.ranks_per_channel.value)
 
-if TOTAL_BANKS % banks_per_channel != 0:
+if total_banks % banks_per_channel != 0:
     fatal("'%s' has %d banks/channel (%d banks/rank x %d ranks), which does "
-          "not divide TOTAL_BANKS=%d.  Choose a type whose banks_per_rank x "
-          "ranks_per_channel is 8, 16, or 32." %
+          "not divide total_banks=%d (from trace).  Choose a type whose "
+          "banks_per_rank x ranks_per_channel divides %d." %
           (options.mem_type, banks_per_channel,
            int(tmp.banks_per_rank.value), int(tmp.ranks_per_channel.value),
-           TOTAL_BANKS))
+           total_banks, total_banks))
 
-num_channels = TOTAL_BANKS // banks_per_channel
+num_channels = total_banks // banks_per_channel
 
-# Per-channel address space: enough for ROWS_PER_SUBARRAY rows of all local
-# banks.  Rounded up to the next power of 2 so DRAMCtrl geometry checks pass.
-channel_size_min = ROWS_PER_SUBARRAY * banks_per_channel * ROW_SIZE_BYTES
+# row_stride: the effective DRAM row buffer size per rank (= device_rowbuffer_size
+# * devices_per_rank) determines the address stride between consecutive slot rows
+# in slotAddr().  Using this (not application ROW_SIZE) ensures DRAMCtrl's
+# bank/row decode assigns the correct DRAM bank to each address and keeps all
+# slot rows within a single 512-row subarray.
+#   DDR4:       1 kB/dev x 8 devs/rank = 8 kB  (= ROW_SIZE, no change vs before)
+#   HBM2/HBM3: 1 kB/dev x 1 dev/rank  = 1 kB
+row_stride = (int(tmp.device_rowbuffer_size.getValue()) *
+              int(tmp.devices_per_rank.value))
+
+# Per-channel address space: ROWS_PER_SUBARRAY row-buffer rows per local bank.
+# Rounded up to the next power of 2 so DRAMCtrl geometry checks pass.
+channel_size_min = ROWS_PER_SUBARRAY * banks_per_channel * row_stride
 channel_size = 1 << int(math.ceil(math.log(channel_size_min, 2)))
 
 base_addr = 0
@@ -134,7 +175,8 @@ system.player = RowOpTracePlayer(
     trace_file        = options.trace,
     base_addr         = base_addr,
     banks_per_channel = banks_per_channel,
-    channel_size      = channel_size)
+    channel_size      = channel_size,
+    row_stride        = row_stride)
 
 system.player.port = system.membus.slave
 system.system_port = system.membus.slave
@@ -158,8 +200,10 @@ print "  Banks/channel  : %d  (%d banks/rank x %d ranks)" % (
     banks_per_channel,
     int(tmp.banks_per_rank.value),
     int(tmp.ranks_per_channel.value))
+print "  Trace format   : %d-bank" % total_banks
 print "  Channels       :", num_channels
 print "  Total banks    :", banks_per_channel * num_channels
+print "  Row stride     : %d B  (DRAM row buffer size)" % row_stride
 print "  Channel size   : %d MB" % (channel_size >> 20)
 print "  Addr map       :", addr_map_str
 print "=" * 64
@@ -192,7 +236,7 @@ try:
     act_found = False
     for m in re.finditer(
             r'system\.mem_ctrls[^.]*\.memoryStateTime::ACT\s+(\d+)', text):
-        act_total += int(m.group(1))
+        act_total += int(m.group(1))/1000
         act_found = True
     act_str = str(act_total) if act_found else "N/A"
 

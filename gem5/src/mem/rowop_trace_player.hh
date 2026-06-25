@@ -30,7 +30,13 @@
  *   local_bank = global_bank % banks_per_channel
  *   slot_addr(slot, global_bank) =
  *       base_addr + channel * channel_size
- *                 + (slot * banks_per_channel + local_bank) * ROW_SIZE
+ *                 + (slot * banks_per_channel + local_bank) * row_stride
+ *
+ *   row_stride = device_rowbuffer_size from the DRAM timing config.
+ *   For DDR4 row_stride == ROW_SIZE (8192); for HBM2/HBM3 row_stride == 1024.
+ *   Using the DRAM row buffer size as the stride ensures DRAMCtrl's bank/row
+ *   decode assigns each (slot, local_bank) pair to the correct DRAM bank and
+ *   keeps all slots within a single 512-row subarray.
  *
  *   DDR4 (banks_per_channel=32, 1 channel) : reduces to the original formula.
  *   HBM2 (banks_per_channel=8,  4 channels): global banks 0-7 → ch0, 8-15 → ch1, …
@@ -102,6 +108,7 @@ class RowOpTracePlayer : public MemObject
     const Addr        baseAddr;
     const int         banksPerChannel; // banks per DRAMCtrl instance
     const Addr        channelSize;     // byte stride between channel base addrs
+    const Addr        rowStride;       // DRAM row buffer size (address stride per slot)
     MasterID          masterID;
 
     // ------------------------------------------------------------------ //

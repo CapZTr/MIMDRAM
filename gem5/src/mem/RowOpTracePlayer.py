@@ -25,4 +25,10 @@ class RowOpTracePlayer(MemObject):
     # 0 is valid only when banks_per_channel == 32 (single channel).
     channel_size = Param.Addr(0, "Address range per channel (bytes)")
 
+    # DRAM row buffer size (device_rowbuffer_size from the timing config).
+    # Used as the address stride between consecutive slot rows so that
+    # DRAMCtrl's bank/row decode assigns the correct bank to each address.
+    # For DDR4 this equals ROW_SIZE (8192); for HBM2/HBM3 it is 1024.
+    row_stride = Param.Addr(8192, "DRAM row buffer size in bytes (row stride)")
+
     system = Param.System(Parent.any, "System this player belongs to")
