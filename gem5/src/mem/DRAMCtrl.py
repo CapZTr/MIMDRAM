@@ -576,7 +576,7 @@ class DDR4_2400_x64(DRAMCtrl):
     # RRD_L (same bank group) for 1K page is MAX(4 CK, 4.9ns)
     tRRD_L = '4.9ns';
 
-    tXAW = '50ns'
+    tXAW = '0ns'
     activation_limit = 4
     tRFC = '350ns'
 

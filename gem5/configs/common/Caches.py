@@ -48,8 +48,8 @@ from m5.objects import *
 
 class L1Cache(Cache):
     assoc = 2
-    hit_latency = 2
-    response_latency = 2
+    hit_latency = 1
+    response_latency = 1
     mshrs = 4
     tgts_per_mshr = 20
 
@@ -61,8 +61,8 @@ class L1_DCache(L1Cache):
 
 class L2Cache(Cache):
     assoc = 8
-    hit_latency = 20
-    response_latency = 20
+    hit_latency = 1
+    response_latency = 1
     mshrs = 20
     tgts_per_mshr = 12
     write_buffers = 500

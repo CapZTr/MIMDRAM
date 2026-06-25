@@ -140,12 +140,11 @@ class SystemXBar(CoherentXBar):
     # 128-bit crossbar by default
     width = 16
 
-    # A handful pipeline stages for each portion of the latency
-    # contributions.
-    frontend_latency = 3
-    forward_latency = 4
-    response_latency = 2
-    snoop_response_latency = 4
+    # Minimized latencies to isolate memory controller (RowOp) latency
+    frontend_latency = 1
+    forward_latency = 1
+    response_latency = 1
+    snoop_response_latency = 1
 
 # In addition to the system interconnect, we typically also have one
 # or more on-chip I/O crossbars. Note that at some point we might want
