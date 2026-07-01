@@ -894,7 +894,7 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick cmd_at,
             "ROWAP","ROWAAP","ROWCOPY",
             "ROWANAP","ROWAAAP","ROWAAAAAP",
             "ROWCLONE","MRC","MAJ","BULK_WRITE",
-            "NOT_XSUB","AND_XSUB","OR_XSUB","FRAC"
+            "NOT_XSUB","AND_XSUB","OR_XSUB","FRAC","MAJ3"
         };
         DPRINTF(DRAM, "RowOp %s rank %d bank %d dst %d src1 %d src2 %d\n",
                 rowOpNames[mem_pkt->row_op],
@@ -965,6 +965,10 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick cmd_at,
                 break;
             case Request::FRAC:
                 fracBank(rank, bank, cmd_at, mem_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::MAJ3:
+                // In-place 3-input MAJ: same charge-sharing MAJ timing as MAJ.
+                majBank(rank, bank, cmd_at, mem_pkt->src1_row, mem_pkt->row); cmd_at = bank.actAllowedAt;
                 break;
             case Request::ROWCOPY: {
                 // Inter-bank / inter-rank row copy: read src, write dst

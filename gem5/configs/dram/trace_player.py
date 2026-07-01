@@ -257,9 +257,10 @@ try:
         m = re.search(pat, txt)
         return m.group(1) if m else "N/A"
 
-    pkts    = extract(r'system\.player\.numPacketsSent\s+(\S+)', text)
-    retries = extract(r'system\.player\.numRetries\s+(\S+)', text)
-    wr_reqs = extract(r'system\.mem_ctrls\.writeReqs\s+(\S+)', text)
+    pkts     = extract(r'system\.player\.numPacketsSent\s+(\S+)', text)
+    retries  = extract(r'system\.player\.numRetries\s+(\S+)', text)
+    makespan = extract(r'system\.player\.rowOpMakespan\s+(\S+)', text)
+    wr_reqs  = extract(r'system\.mem_ctrls\.writeReqs\s+(\S+)', text)
 
     # Sum ACT ticks across all channel controllers
     act_total = 0
@@ -270,13 +271,22 @@ try:
         act_found = True
     act_str = str(act_total) if act_found else "N/A"
 
+    # Row-op runtime: makespan of the row-op phase (benchmark wall-clock).
+    # sim_freq is 1e12 ticks/s, so 1 ns == 1000 ticks.
+    try:
+        runtime_ns = "%.1f" % (int(makespan) / 1000.0)
+    except (ValueError, TypeError):
+        runtime_ns = "N/A"
+
     print ""
     print "=" * 64
     print "Results"
+    print "  Row-op runtime (ns)   :", runtime_ns, "   <-- benchmark runtime"
+    print "  Row-op runtime (ticks):", makespan
     print "  Packets sent          :", pkts
     print "  Retries (back-press)  :", retries
     print "  DRAM write reqs (ch0) :", wr_reqs
-    print "  Total DRAM ACT ticks  :", act_str
+    print "  Total DRAM ACT ticks  :", act_str, "  (aggregate active time, NOT runtime)"
     print "=" * 64
 except IOError:
     print "(stats file not found at %s)" % stats_path

@@ -99,6 +99,7 @@ class RowOpTracePlayer : public MemObject
         int src1_bank;
         int src2_slot; // unused for current Ambit ops
         int src2_bank;
+        int64_t start; // scheduler start-time of the originating trace record
     };
 
     // ------------------------------------------------------------------ //
@@ -135,9 +136,26 @@ class RowOpTracePlayer : public MemObject
     // Runtime state
     // ------------------------------------------------------------------ //
     std::vector<PendingOp> pendingOps;
-    size_t    currentOp;
-    bool      waitingResp;
+
+    // Multiple-outstanding issue engine, grouped by the schedule's start-time.
+    // All row-ops of one start-group are issued concurrently (bounded only by
+    // the memory's own back-pressure), so independent banks/channels overlap
+    // exactly as the scheduler assumes.  A dependency barrier between groups
+    // (issue group G+1 only after all of group G completes) preserves the
+    // schedule's ordering.  This makes the measured runtime reflect bank/
+    // channel parallelism instead of the total per-bank packet count.
+    std::vector<size_t> groupEnds;   // cumulative end index of each start-group
+    size_t    curGroup;              // index of the group currently in flight
+    size_t    issueIdx;              // next pendingOps index to issue
+    size_t    completedCount;        // total responses received
     PacketPtr retryPkt;
+
+    // Row-op makespan: tick the first row-op is accepted by the memory and
+    // tick the last row-op completes.  Their difference is the wall-clock span
+    // of the row-op phase (the benchmark runtime), excluding harness startup.
+    bool      firstOpSeen;
+    Tick      firstOpTick;
+    Tick      lastOpTick;
 
     // Data-pool slot offsets (set from the trace's max widths)
     int lhsBase, rhsBase, outBase, partialBase, tmpBase, carryBase;
@@ -188,6 +206,10 @@ class RowOpTracePlayer : public MemObject
     void emitAndXsub(int com_slot,               const std::vector<int>& banks);
     void emitOrXsub (int com_slot,               const std::vector<int>& banks);
     void emitNotXsub(int dst_slot,               const std::vector<int>& banks);
+    // Native COTS 3-input majority: com = MAJ(com, s1, s2), intra-subarray
+    // triple-row activation (all three slots in subarray 0).
+    void emitMaj3   (int com_slot, int s1_slot, int s2_slot,
+                     const std::vector<int>& banks);
 
     // COTS multi-bank composite emitters (mirror the C helpers in 96_...)
     void emitRowAndFc(int lhs_slot, int rhs_slot, int out_slot,
@@ -222,6 +244,9 @@ class RowOpTracePlayer : public MemObject
     // ------------------------------------------------------------------ //
     Stats::Scalar numPacketsSent;
     Stats::Scalar numRetries;
+    // Wall-clock span of the row-op phase, in ticks (last completion - first
+    // issue).  This is the benchmark runtime metric.
+    Stats::Scalar rowOpMakespan;
 };
 
 #endif // __MEM_ROWOP_TRACE_PLAYER_HH__

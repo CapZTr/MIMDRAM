@@ -247,6 +247,7 @@
                     0x6b: RowOp::AND_XSUB();
                     0x6c: RowOp::OR_XSUB();
                     0x6d: RowOp::FRAC();
+                    0x6e: RowOp::MAJ3();
                     default: Inst::UD2();
                 }
             }

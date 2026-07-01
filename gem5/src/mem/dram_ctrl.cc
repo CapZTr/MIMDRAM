@@ -63,7 +63,6 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     retryRdReq(false), retryWrReq(false),
     busState(READ),
     pendingRowOps(0),
-    firstRowOpPrinted(false), lastRowOpPrinted(false), lastRowOpTick(0),
     nextReqEvent(this), respondEvent(this),
     deviceSize(p->device_size),
     deviceBusWidth(p->device_bus_width), burstLength(p->burst_length),
@@ -1478,6 +1477,31 @@ DRAMCtrl::majBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
 }
 
 void
+DRAMCtrl::maj3Bank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_src, uint32_t row_dst)
+{
+    // In-place 3-input MAJ (triple-row activation within one subarray).
+    // Same charge-sharing MAJ timing as majBank; fixed 3 operands so there is
+    // no range/N assertion (row_src/row_dst just identify the bank+subarray).
+    DPRINTF(DRAM, "MAJ3 rank %d bank %d rows %d,%d at tick %d\n",
+            rank_ref.rank, bank_ref.bank, row_src, row_dst, act_tick);
+    assert(bank_ref.openRow == Bank::NO_ROW);
+    bank_ref.openRow = Bank::DOUBLE_ROW;
+    bank_ref.bytesAccessed = 0;
+    bank_ref.rowAccesses   = 0;
+    ++rank_ref.numBanksActive;
+    assert(rank_ref.numBanksActive <= banksPerRank);
+    bank_ref.preAllowedAt = act_tick + pudTRAS_viol + pudTRP_viol + tRAS;
+    pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
+                             banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
+    if (!rank_ref.activateEvent.scheduled())
+        schedule(rank_ref.activateEvent, act_tick);
+    else if (rank_ref.activateEvent.when() > act_tick)
+        reschedule(rank_ref.activateEvent, act_tick);
+    prechargeBank(rank_ref, bank_ref, bank_ref.preAllowedAt);
+}
+
+void
 DRAMCtrl::bulkWriteBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
         uint32_t row_first, uint32_t row_last)
 {
@@ -1636,7 +1660,7 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
             "ROWAP", "ROWAAP", "ROWCOPY",
             "ROWANAP", "ROWAAAP", "ROWAAAAAP",
             "ROWCLONE", "MRC", "MAJ", "BULK_WRITE",
-            "NOT_XSUB", "AND_XSUB", "OR_XSUB", "FRAC"
+            "NOT_XSUB", "AND_XSUB", "OR_XSUB", "FRAC", "MAJ3"
         };
         DPRINTF(DRAM, "RowOp %s rank %d bank %d dest_row %d src1_row %d src2_row %d\n",
                 rowOpNames[dram_pkt->row_op],
@@ -1671,28 +1695,18 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 break;
             case Request::ROWAP:
                 apBank (rank, bank, cmd_at, Bank::B_T0_T1_T2); cmd_at = bank.actAllowedAt;		//TODO replace Bank::B_T0_T1_T2 with correct bank
-                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAP (first)" << std::endl; firstRowOpPrinted = true; }
-                lastRowOpTick = curTick();
 		        break;
             case Request::ROWAAP:
                 aapBank(rank, bank, cmd_at, 0, 0, true); cmd_at = bank.actAllowedAt;	//TODO replace NULLs with correct banks
-                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAAP (first)" << std::endl; firstRowOpPrinted = true; }
-                lastRowOpTick = curTick();
                 break;
             case Request::ROWANAP:
                 anapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
-                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWANAP (first)" << std::endl; firstRowOpPrinted = true; }
-                lastRowOpTick = curTick();
                 break;
             case Request::ROWAAAP:
                 aaapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->src2_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
-                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAAAP (first)" << std::endl; firstRowOpPrinted = true; }
-                lastRowOpTick = curTick();
                 break;
             case Request::ROWAAAAAP:
                 aaaaapBank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->src2_row, dram_pkt->row, dram_pkt->row, dram_pkt->row); cmd_at = bank.actAllowedAt;
-                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWAAAAAP (first)" << std::endl; firstRowOpPrinted = true; }
-                lastRowOpTick = curTick();
                 break;
             // PUD COTS DDR4 primitives based on Pulsar and FCDRAM
             case Request::ROWCLONE:
@@ -1718,6 +1732,9 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 break;
             case Request::FRAC:
                 fracBank(rank, bank, cmd_at, dram_pkt->row); cmd_at = bank.actAllowedAt;
+                break;
+            case Request::MAJ3: // In-place 3-input MAJ (charge-sharing MAJ timing, no range assert)
+                maj3Bank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
                 break;
             case Request::ROWCOPY: {
                 bool same_subarray =
@@ -1804,8 +1821,6 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                             dram_pkt->rank, dram_pkt->bank, dram_pkt->row,
                             rd_col_at, wr_col_at);
                 }
-                if (!firstRowOpPrinted) { std::cout << curTick() << "     ROWCOPY (first)" << std::endl; firstRowOpPrinted = true; }
-                lastRowOpTick = curTick();
                 break;
             }
             default:
@@ -2924,17 +2939,6 @@ DRAMCtrl::regStats()
 
     pageHitRate = (writeRowHits + readRowHits) /
         (writeBursts - mergedWrBursts + readBursts - servicedByWrQ) * 100;
-
-    registerExitCallback(new MakeCallback<DRAMCtrl, &DRAMCtrl::printLastRowOp>(this));
-}
-
-void
-DRAMCtrl::printLastRowOp()
-{
-    if (firstRowOpPrinted && !lastRowOpPrinted) {
-        std::cout << lastRowOpTick << "     ROWOP (last)" << std::endl;
-        lastRowOpPrinted = true;
-    }
 }
 
 void

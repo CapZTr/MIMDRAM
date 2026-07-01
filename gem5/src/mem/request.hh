@@ -218,7 +218,8 @@ class Request
         NOT_XSUB,    // Cross-subarray NOT: ACT src → tRAS → PRE(viol.tRP) → ACT dst → tRAS → PRE
         AND_XSUB,    // Cross-subarray AND: init ref rows → APA(ref, com) → result in com rows
         OR_XSUB,     // Cross-subarray OR:  init ref rows → APA(ref, com) → result in com rows
-        FRAC         // VDD/2 init: (ACT → PRE_viol) × frac_iters
+        FRAC,        // VDD/2 init: (ACT → PRE_viol) × frac_iters
+        MAJ3         // In-place 3-input MAJ: dest = MAJ(dest, src1, src2); MAJ-latency timing
     };
 
     struct RowOpPayload {

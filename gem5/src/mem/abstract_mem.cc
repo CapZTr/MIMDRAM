@@ -461,6 +461,13 @@ AbstractMemory::access(PacketPtr pkt)
                 for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t))
                     *dest++ = ~0ULL;
                 break;
+            case Request::MAJ3:
+                // In-place 3-input majority: dest = MAJ(dest, src1, src2)
+                for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t)) {
+                    uint64_t a = *dest, b = *src1++, c = *src2++;
+                    *dest++ = (a & b) | (a & c) | (b & c);
+                }
+                break;
             default:
                 assert(false);
                 break;

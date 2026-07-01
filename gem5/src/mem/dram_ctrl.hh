@@ -147,10 +147,6 @@ class DRAMCtrl : public AbstractMemory
     BusState busState;
 
     int pendingRowOps;
-    bool firstRowOpPrinted;
-    bool lastRowOpPrinted;
-    Tick lastRowOpTick;
-    void printLastRowOp();
 
     /**
      * A basic class to track the bank state, i.e. what row is
@@ -723,6 +719,10 @@ class DRAMCtrl : public AbstractMemory
     /** MAJ/charge-sharing: ACT rf(viol.tRAS) → PRE(viol.tRP) → ACT rl → tRAS → PRE */
     void majBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
         uint32_t row_first, uint32_t row_last);
+    /** In-place 3-input MAJ (triple-row activation): same charge-sharing MAJ
+     *  timing as majBank but fixed 3 operands, so no range/N assertion. */
+    void maj3Bank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
+        uint32_t row_src, uint32_t row_dst);
     /** BULK_WRITE: MAJ sequence then WRITE write_data to all N active rows */
     void bulkWriteBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
         uint32_t row_first, uint32_t row_last);

@@ -20,6 +20,7 @@
  *                    "Functionally-Complete Boolean Logic in Real DRAM Chips"
  *                    -> AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates)
  *                    -> ROWCLONE (intra-subarray copy)
+ *                    -> MAJ3 (native COTS 3-input majority, com=MAJ(com,s1,s2))
  *
  * Bit-serial / transposed layout is unchanged: one bit-plane per DRAM row,
  * elements laid out along the bitline, so each row-op is a SIMD gate over a
@@ -29,16 +30,18 @@
  * Mul  : shift-add, identical schedule to the SIMDRAM runner, but every
  *        bit-row AND / full-add is built from the COTS gates above.
  *
- * Because FCDRAM only exposes the {AND, OR, NOT} functionally-complete set
- * (no native XOR / MAJ3 control row), the full adder is expanded as:
- *     axb  = (a OR b) AND NOT(a AND b)            ; a XOR b
- *     sum  = (axb OR c) AND NOT(axb AND c)        ; a XOR b XOR c
- *     cout = (a AND b) OR (c AND axb)             ; MAJ(a,b,c)
- * Each gate is in-place on its first operand (com = com OP ref), so we stage
- * through control scratch rows B_T0..B_T3 and B_DCC0 (allocated by
- * init_ambit). C_0 is used as the constant-0 row; gem5 SE zero-fills fresh
- * pages, so C_0 reads as logic-0 without an explicit initialisation, exactly
- * as in the SIMDRAM runner.
+ * COTS DDR4 also natively supports the 3-input majority (MAJ3) that prior
+ * works (ComputeDRAM/FracDRAM/DRAM Bender) demonstrate and that FCDRAM's own
+ * VREF-threshold mechanism yields at VREF=VDD/2. The full adder therefore uses
+ * MAJ3 directly instead of reconstructing the carry out of {AND,OR,NOT}:
+ *     cout = MAJ(a, b, cin)
+ *     sum  = MAJ(~cout, cin, MAJ(a, b, ~cout))    ; a XOR b XOR cin
+ * This is 8 row-ops (vs. 16 for the {AND,OR,NOT} expansion), and each MAJ3 is
+ * ~half the latency of an xsub gate. Each gate is in-place on its first
+ * operand (com = com OP ref / com = MAJ(com,s1,s2)), so we stage through
+ * control scratch rows B_T0..B_T3 (allocated by init_ambit). C_0 is used as
+ * the constant-0 row; gem5 SE zero-fills fresh pages, so C_0 reads as logic-0
+ * without an explicit initialisation, exactly as in the SIMDRAM runner.
  * --------------------------------------------------------------------- */
 #define HBM_BANKS 128
 #define HBM_ALIGNMENT ((size_t)ROW_SIZE * HBM_BANKS)
@@ -60,6 +63,8 @@
     rowop_or_xsub(BANK_ROW((com), (bank)), BANK_ROW((ref), (bank)))
 #define NOT_ONE_BANK(dst, src, bank) \
     rowop_not_xsub(BANK_ROW((dst), (bank)), BANK_ROW((src), (bank)))
+#define MAJ3_ONE_BANK(com, s1, s2, bank) \
+    rowop_maj3(BANK_ROW((com), (bank)), BANK_ROW((s1), (bank)), BANK_ROW((s2), (bank)))
 
 /* -----------------------------------------------------------------------
  * Verbosity level (set via -v / -vv command-line flag):
@@ -127,6 +132,10 @@ static inline void g_not(unsigned *dst, unsigned *src,
                          const int *bk, int n) {
     for (int i = 0; i < n; i++) NOT_ONE_BANK(dst, src, bk[i]);
 }
+static inline void g_maj3(unsigned *com, unsigned *s1, unsigned *s2,
+                          const int *bk, int n) {
+    for (int i = 0; i < n; i++) MAJ3_ONE_BANK(com, s1, s2, bk[i]);
+}
 
 /* -----------------------------------------------------------------------
  * Bit-serial primitives used by execute_add and execute_mul.
@@ -143,9 +152,21 @@ static inline void execute_row_and(
 
 /* Full adder:  out_bit = lhs ^ rhs ^ cin,  cout_bit = MAJ(lhs, rhs, cin).
  *
- * Inputs lhs/rhs are read only in the first stage; cin is read before any
- * output is written, so cout_bit may safely alias cin_bit (in-place carry).
- * Staging rows: B_T2=a&b, B_T0=a^b, B_T1=c&(a^b), B_T3=cout, B_DCC0=sum. */
+ * MAJ-based decomposition using the native COTS 3-input majority (rowop_maj3)
+ * instead of expanding the carry out of {AND,OR,NOT}:
+ *     cout = MAJ(a, b, cin)
+ *     sum  = MAJ(~cout, cin, MAJ(a, b, ~cout))        ; a ^ b ^ cin
+ * The sum identity holds for all 8 input combinations and needs only 3-input
+ * majorities plus one NOT (no 5-input MAJ, so it fits the 3-address row-op
+ * ABI). g_maj3(com,s1,s2) is in-place: com = MAJ(com, s1, s2).
+ *
+ * 8 row-ops (3 CLONE + 1 NOT + 3 MAJ3 + 1 CLONE) vs. the 16-op {AND,OR,NOT}
+ * expansion; MAJ3 is also ~half the latency of an xsub gate (majBank timing).
+ *
+ * Inputs lhs/rhs are never written; cin_bit is read before cout_bit is
+ * written, so cout_bit may safely alias cin_bit (in-place carry) and rhs_bit
+ * may alias cin_bit (as in execute_mul's last full-adder). Staging rows:
+ * B_T3=cout, B_T2=~cout, B_T0=inner=MAJ(a,b,~cout). */
 static inline void execute_row_add(
     unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit,
     unsigned *cin_bit, unsigned *cout_bit,
@@ -154,33 +175,23 @@ static inline void execute_row_add(
     const int *bk = bank_ids;
     int n = bank_count;
 
-    /* a & b -> B_T2 */
-    g_clone(B_T2, lhs_bit, bk, n);
-    g_and  (B_T2, rhs_bit, bk, n);
+    /* cout = MAJ(a, b, cin) -> B_T3 */
+    g_clone(B_T3, lhs_bit, bk, n);            /* B_T3 = a                */
+    g_maj3 (B_T3, rhs_bit, cin_bit, bk, n);   /* B_T3 = MAJ(a,b,cin)=cout */
 
-    /* axb = (a|b) & ~(a&b) -> B_T0 */
-    g_clone(B_T0, lhs_bit, bk, n);
-    g_or   (B_T0, rhs_bit, bk, n);
-    g_not  (B_T3, B_T2,    bk, n);   /* ~(a&b) */
-    g_and  (B_T0, B_T3,    bk, n);   /* a ^ b  */
+    /* ~cout -> B_T2 */
+    g_not  (B_T2, B_T3, bk, n);               /* B_T2 = ~cout            */
 
-    /* c & axb -> B_T1 */
-    g_clone(B_T1, B_T0,    bk, n);
-    g_and  (B_T1, cin_bit, bk, n);
+    /* inner = MAJ(a, b, ~cout) -> B_T0 */
+    g_clone(B_T0, lhs_bit, bk, n);            /* B_T0 = a                */
+    g_maj3 (B_T0, rhs_bit, B_T2, bk, n);      /* B_T0 = MAJ(a,b,~cout)   */
 
-    /* cout = (a&b) | (c&axb) -> B_T3 */
-    g_clone(B_T3, B_T2, bk, n);
-    g_or   (B_T3, B_T1, bk, n);
+    /* sum = MAJ(~cout, cin, inner) -> out_bit  (reads cin before cout write) */
+    g_clone(out_bit, B_T2, bk, n);            /* out_bit = ~cout         */
+    g_maj3 (out_bit, cin_bit, B_T0, bk, n);   /* out_bit = a^b^cin = sum */
 
-    /* sum = (axb|c) & ~(axb&c) -> B_DCC0 */
-    g_clone(B_DCC0, B_T0,    bk, n);
-    g_or   (B_DCC0, cin_bit, bk, n);   /* axb | c    */
-    g_not  (B_T2,   B_T1,    bk, n);   /* ~(c & axb) */
-    g_and  (B_DCC0, B_T2,    bk, n);   /* axb ^ c    */
-
-    /* commit results (cin read is complete, so aliasing cout==cin is safe) */
-    g_clone(out_bit,  B_DCC0, bk, n);
-    g_clone(cout_bit, B_T3,   bk, n);
+    /* commit carry last, so aliasing cout==cin (and rhs==cin) is safe */
+    g_clone(cout_bit, B_T3, bk, n);
 }
 
 /* -----------------------------------------------------------------------

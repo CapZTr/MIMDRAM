@@ -1,5 +1,6 @@
 #include "mem/rowop_trace_player.hh"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -65,6 +66,7 @@ static_assert(sizeof(TraceRecord128) == 48, "TraceRecord128 size mismatch");
 
 // Normalised record used internally after reading either format.
 struct NormRecord {
+    int64_t  start;
     uint64_t banks[2];
     int      lhs_bw;
     int      rhs_bw;
@@ -109,9 +111,9 @@ RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
       rowStride(p->row_stride),
       backend(parseBackend(p->backend)),
       masterID(p->system->getMasterId(name())),
-      currentOp(0),
-      waitingResp(false),
+      curGroup(0), issueIdx(0), completedCount(0),
       retryPkt(nullptr),
+      firstOpSeen(false), firstOpTick(0), lastOpTick(0),
       lhsBase(SLOT_DATA_BASE), rhsBase(0), outBase(0),
       partialBase(0), tmpBase(0), carryBase(0),
       sendEvent(this)
@@ -146,6 +148,10 @@ RowOpTracePlayer::regStats()
     numRetries
         .name(name() + ".numRetries")
         .desc("Number of send retries due to back-pressure");
+
+    rowOpMakespan
+        .name(name() + ".rowOpMakespan")
+        .desc("Row-op phase makespan in ticks (last completion - first issue)");
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +372,9 @@ RowOpTracePlayer::expandMulSimdram(int lhs_bw, int rhs_bw,
 // Mirrors 96_fcdram_schedule_runner_hbm.c.  ADDI/MULI keep the exact same
 // bit-serial shift-add schedule as the SIMDRAM backend; only the bit-row AND
 // and full-adder primitives change, now built from ROWCLONE (intra-subarray
-// copy) and AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates).
+// copy), AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates) and MAJ3 (native
+// COTS intra-subarray 3-input majority).  The full adder uses MAJ3 for both
+// carry and sum instead of reconstructing them from {AND,OR,NOT}.
 //
 // Cross-subarray gates require the compute (com/dst) row and its reference to
 // live in neighbouring subarrays of the same bank.  slotAddr() maps slot->row
@@ -423,6 +431,18 @@ RowOpTracePlayer::emitNotXsub(int dst_slot, const std::vector<int>& banks)
                               dst_slot + ROWS_PER_SUBARRAY, b, 0, b});
 }
 
+// MAJ3: com = MAJ(com, s1, s2), intra-subarray triple-row activation.  All
+// three operands live in subarray 0 (no mirror), so dram_ctrl accepts it as an
+// intra-subarray op; timing reuses the charge-sharing MAJ latency (majBank).
+void
+RowOpTracePlayer::emitMaj3(int com_slot, int s1_slot, int s2_slot,
+                            const std::vector<int>& banks)
+{
+    for (int b : banks)
+        pendingOps.push_back({Request::MAJ3,
+                              com_slot, b, s1_slot, b, s2_slot, b});
+}
+
 // execute_row_and:  out = lhs AND rhs   (ROWCLONE then AND_XSUB)
 void
 RowOpTracePlayer::emitRowAndFc(int lhs_slot, int rhs_slot, int out_slot,
@@ -433,44 +453,36 @@ RowOpTracePlayer::emitRowAndFc(int lhs_slot, int rhs_slot, int out_slot,
     emitAndXsub(out_slot,           banks);  // out = out AND rhs
 }
 
-// execute_row_add:  full adder built from COTS {AND,OR,NOT}_XSUB + ROWCLONE.
-//   out  = lhs ^ rhs ^ cin,   cout = MAJ(lhs, rhs, cin)
-// Comments state the intended value; staging rows match the C helper exactly
-// (B_T2=a&b, B_T0=a^b, B_T1=c&(a^b), B_T3=cout, B_DCC0=sum).
+// execute_row_add:  MAJ-based full adder using the native COTS 3-input MAJ.
+//   cout = MAJ(a, b, cin)
+//   sum  = MAJ(~cout, cin, MAJ(a, b, ~cout))   ; a ^ b ^ cin
+// 8 row-ops (4 CLONE + 1 NOT + 3 MAJ3) vs. 16 for the {AND,OR,NOT} expansion.
+// Staging rows: B_T3=cout, B_T2=~cout, B_T0=inner=MAJ(a,b,~cout).  This is a
+// timing model, so NOT_XSUB reads its neighbouring-subarray mirror (the
+// logical operand ~cout in B_T3 documents intent); MAJ3 operands are addressed
+// intra-subarray for the same-subarray/count assertions in dram_ctrl.
 void
 RowOpTracePlayer::emitRowAddFc(int lhs_slot, int rhs_slot, int out_slot,
                                 int cin_slot, int cout_slot,
                                 const std::vector<int>& banks)
 {
-    (void)rhs_slot; (void)cin_slot; // references; addressed via com-row mirrors
+    // cout = MAJ(a, b, cin) -> B_T3
+    emitClone(SLOT_T3, lhs_slot, banks);                 // B_T3 = a
+    emitMaj3 (SLOT_T3, rhs_slot, cin_slot, banks);        // B_T3 = MAJ(a,b,cin)=cout
 
-    // a & b -> B_T2
-    emitClone  (SLOT_T2, lhs_slot, banks);   // B_T2 = a
-    emitAndXsub(SLOT_T2,           banks);   // B_T2 = a AND b
+    // ~cout -> B_T2
+    emitNotXsub(SLOT_T2, banks);                          // B_T2 = ~cout
 
-    // axb = (a|b) & ~(a&b) -> B_T0
-    emitClone  (SLOT_T0, lhs_slot, banks);   // B_T0 = a
-    emitOrXsub (SLOT_T0,           banks);   // B_T0 = a OR b
-    emitNotXsub(SLOT_T3,           banks);   // B_T3 = ~(a AND b)
-    emitAndXsub(SLOT_T0,           banks);   // B_T0 = (a|b) AND ~(a&b) = a XOR b
+    // inner = MAJ(a, b, ~cout) -> B_T0
+    emitClone(SLOT_T0, lhs_slot, banks);                 // B_T0 = a
+    emitMaj3 (SLOT_T0, rhs_slot, SLOT_T2, banks);         // B_T0 = MAJ(a,b,~cout)
 
-    // c & axb -> B_T1
-    emitClone  (SLOT_T1, SLOT_T0,  banks);   // B_T1 = axb
-    emitAndXsub(SLOT_T1,           banks);   // B_T1 = axb AND c
+    // sum = MAJ(~cout, cin, inner) -> out
+    emitClone(out_slot, SLOT_T2, banks);                 // out = ~cout
+    emitMaj3 (out_slot, cin_slot, SLOT_T0, banks);        // out = a^b^cin = sum
 
-    // cout = (a&b) | (c&axb) -> B_T3
-    emitClone  (SLOT_T3, SLOT_T2,  banks);   // B_T3 = a AND b
-    emitOrXsub (SLOT_T3,           banks);   // B_T3 = (a&b) OR (c&axb)
-
-    // sum = (axb|c) & ~(axb&c) -> B_DCC0
-    emitClone  (SLOT_DCC0, SLOT_T0, banks);  // B_DCC0 = axb
-    emitOrXsub (SLOT_DCC0,          banks);  // B_DCC0 = axb OR c
-    emitNotXsub(SLOT_T2,            banks);  // B_T2 = ~(c AND axb)
-    emitAndXsub(SLOT_DCC0,          banks);  // B_DCC0 = (axb|c) AND ~(axb&c) = sum
-
-    // commit
-    emitClone(out_slot,  SLOT_DCC0, banks);  // out  = sum
-    emitClone(cout_slot, SLOT_T3,   banks);  // cout = carry-out
+    // commit carry last (aliasing cout==cin is safe: cin read before this)
+    emitClone(cout_slot, SLOT_T3, banks);                // cout = carry-out
 }
 
 // FCDRAM execute_add — ripple-carry adder (one full adder per bit).
@@ -605,6 +617,7 @@ RowOpTracePlayer::loadTrace()
             if (fread(&raw, sizeof(raw), 1, f) != 1)
                 panic("RowOpTracePlayer: truncated trace at record %llu",
                       (unsigned long long)i);
+            nr.start    = raw.start;
             nr.banks[0] = raw.banks;
             nr.banks[1] = 0;
             nr.lhs_bw = raw.lhs_bw;
@@ -617,6 +630,7 @@ RowOpTracePlayer::loadTrace()
             if (fread(&raw, sizeof(raw), 1, f) != 1)
                 panic("RowOpTracePlayer: truncated trace at record %llu",
                       (unsigned long long)i);
+            nr.start    = raw.start;
             nr.banks[0] = raw.banks[0];
             nr.banks[1] = raw.banks[1];
             nr.lhs_bw = raw.lhs_bw;
@@ -661,7 +675,14 @@ RowOpTracePlayer::loadTrace()
         panic("RowOpTracePlayer: %d slots exceed rows_per_subarray (%d)",
               totalSlots, ROWS_PER_SUBARRAY);
 
-    // --- Expand records into PendingOps ---
+    // Process records in schedule start-time order so that same-start records
+    // (which the scheduler runs concurrently) expand into a contiguous group.
+    std::stable_sort(records.begin(), records.end(),
+                     [](const NormRecord& a, const NormRecord& b) {
+                         return a.start < b.start;
+                     });
+
+    // --- Expand records into PendingOps, tagging each with its start-time ---
     for (uint64_t i = 0; i < hdr.num_records; i++) {
         const NormRecord& r = records[i];
 
@@ -671,6 +692,7 @@ RowOpTracePlayer::loadTrace()
             if (r.banks[b >> 6] & (1ull << (b & 63)))
                 banks.push_back(b);
 
+        size_t before = pendingOps.size();
         switch (r.kind) {
           case OP_ADDI:
             expandAdd(r.lhs_bw, r.rhs_bw, banks);
@@ -685,6 +707,20 @@ RowOpTracePlayer::loadTrace()
             panic("RowOpTracePlayer: unknown op kind %u at record %llu",
                   r.kind, (unsigned long long)i);
         }
+        for (size_t k = before; k < pendingOps.size(); k++)
+            pendingOps[k].start = r.start;
+    }
+
+    // --- Build start-group boundaries (cumulative end index of each group) ---
+    // Ops within a group share a start-time and are issued concurrently; a
+    // dependency barrier separates consecutive groups.
+    groupEnds.clear();
+    for (size_t i = 0; i < pendingOps.size(); ) {
+        int64_t s = pendingOps[i].start;
+        size_t j = i + 1;
+        while (j < pendingOps.size() && pendingOps[j].start == s) j++;
+        groupEnds.push_back(j);
+        i = j;
     }
 
     inform("RowOpTracePlayer: expanded to %llu row-op packets",
@@ -705,38 +741,41 @@ RowOpTracePlayer::startup()
 }
 
 // ---------------------------------------------------------------------------
-// sendNextOp: convert current PendingOp to a Packet and send it
+// sendNextOp: issue (pump) all remaining row-ops of the current start-group,
+// concurrently, until the memory back-pressures.  Ops of one start-group are
+// independent (the scheduler placed them at the same time), so they are all in
+// flight at once; the memory's per-bank/channel timing overlaps independent
+// banks and serialises same-bank chains.  The barrier that gates the *next*
+// group lives in recvTimingResp.
 // ---------------------------------------------------------------------------
 
 void
 RowOpTracePlayer::sendNextOp()
 {
-    assert(!waitingResp);
-    assert(currentOp < pendingOps.size());
+    size_t groupEnd = groupEnds[curGroup];
 
-    const PendingOp& op = pendingOps[currentOp];
+    while (issueIdx < groupEnd) {
+        const PendingOp& op = pendingOps[issueIdx];
 
-    Addr dest = slotAddr(op.dest_slot, op.dest_bank);
-    Addr src1 = slotAddr(op.src1_slot, op.src1_bank);
-    Addr src2 = (op.op == Request::ROWCOPY) ? 0
-                                             : slotAddr(op.src2_slot, op.src2_bank);
+        Addr dest = slotAddr(op.dest_slot, op.dest_bank);
+        Addr src1 = slotAddr(op.src1_slot, op.src1_bank);
+        Addr src2 = (op.op == Request::ROWCOPY) ? 0
+                                                 : slotAddr(op.src2_slot, op.src2_bank);
 
-    PacketPtr pkt = makeRowOpPacket(op.op, dest, src1, src2);
+        PacketPtr pkt = makeRowOpPacket(op.op, dest, src1, src2);
 
-    DPRINTF(RowOpTracePlayer,
-            "Sending op %llu/%llu: op=%d dest=0x%llx src1=0x%llx src2=0x%llx\n",
-            (unsigned long long)currentOp, (unsigned long long)pendingOps.size(),
-            (int)op.op, (unsigned long long)dest,
-            (unsigned long long)src1, (unsigned long long)src2);
+        if (!port.sendTimingReq(pkt)) {
+            // Back-pressure: stash and resume from recvReqRetry.
+            retryPkt = pkt;
+            numRetries++;
+            return;
+        }
 
-    if (!port.sendTimingReq(pkt)) {
-        // Back-pressure: stash and wait for retry
-        retryPkt = pkt;
-        numRetries++;
-    } else {
-        waitingResp = true;
+        issueIdx++;
         numPacketsSent++;
+        if (!firstOpSeen) { firstOpSeen = true; firstOpTick = curTick(); }
     }
+    // Whole group issued; wait for all its completions before the next group.
 }
 
 // ---------------------------------------------------------------------------
@@ -758,24 +797,29 @@ RowOpTracePlayer::TraceMasterPort::recvReqRetry()
 bool
 RowOpTracePlayer::recvTimingResp(PacketPtr pkt)
 {
-    assert(waitingResp);
-
     // Clean up the packet
     delete pkt->req;
     delete pkt;
 
-    waitingResp = false;
-    currentOp++;
+    completedCount++;
+    lastOpTick = curTick();   // completion tick of the row-op just finished
 
-    if (currentOp >= pendingOps.size()) {
-        inform("RowOpTracePlayer: all %llu packets completed, exiting",
-               (unsigned long long)pendingOps.size());
-        exitSimLoop("RowOpTracePlayer: trace replay complete");
-        return true;
+    // Advance only when the entire current start-group has retired: this is the
+    // dependency barrier that keeps start-group G+1 strictly after group G.
+    if (completedCount >= groupEnds[curGroup]) {
+        if (completedCount >= pendingOps.size()) {
+            rowOpMakespan = lastOpTick - firstOpTick;
+            inform("RowOpTracePlayer: all %llu packets completed, exiting "
+                   "(row-op makespan %llu ticks over %llu start-groups)",
+                   (unsigned long long)pendingOps.size(),
+                   (unsigned long long)(lastOpTick - firstOpTick),
+                   (unsigned long long)groupEnds.size());
+            exitSimLoop("RowOpTracePlayer: trace replay complete");
+            return true;
+        }
+        curGroup++;                            // move to next start-group
+        schedule(&sendEvent, curTick() + 1);   // issue it
     }
-
-    // Schedule the next send at the next tick
-    schedule(&sendEvent, curTick() + 1);
     return true;
 }
 
@@ -784,16 +828,18 @@ RowOpTracePlayer::recvReqRetry()
 {
     assert(retryPkt != nullptr);
 
-    PacketPtr pkt = retryPkt;
-    retryPkt = nullptr;
-
-    if (!port.sendTimingReq(pkt)) {
-        retryPkt = pkt;
+    if (!port.sendTimingReq(retryPkt)) {
+        // Still blocked; wait for the next retry callback.
         numRetries++;
-    } else {
-        waitingResp = true;
-        numPacketsSent++;
+        return;
     }
+
+    // Stashed packet accepted: count it and resume issuing the current group.
+    retryPkt = nullptr;
+    issueIdx++;
+    numPacketsSent++;
+    if (!firstOpSeen) { firstOpSeen = true; firstOpTick = curTick(); }
+    sendNextOp();
 }
 
 RowOpTracePlayer*

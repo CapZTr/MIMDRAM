@@ -19,6 +19,8 @@ extern void rowop_not_xsub(void *dst, void *src);
 extern void rowop_and_xsub(void *com, void *ref);
 extern void rowop_or_xsub(void *com, void *ref);
 extern void rowop_frac(void *dst);
+/* In-place 3-input majority: com = MAJ(com, src1, src2). */
+extern void rowop_maj3(void *com, void *src1, void *src2);
 
 #define ROW_SIZE 8192
 #define BANK_COUNT 16
