@@ -62,6 +62,28 @@ parser.add_option("--addr-map", type="string", default="",
                   help="Override addr_mapping (e.g. RoRaBaCoCh, RoRaBaChCo). "
                        "Empty = use the memory type's default.")
 
+# ---------------------------------------------------------------------------
+# Row-op expansion backend.  Each backend lowers the same CIMTRACE schedule
+# onto a different PuD substrate and needs a different number of subarrays:
+#   simdram : Ambit AAP/AP, all rows in one subarray            (94_...)
+#   fcdram  : COTS cross-subarray gates need com + ref rows in
+#             two neighbouring subarrays                        (96_...)
+# To add a backend: register its name -> subarray count here and add the
+# matching expand* implementation in src/mem/rowop_trace_player.cc.
+# ---------------------------------------------------------------------------
+BACKEND_SUBARRAYS = {
+    "simdram": 1,
+    "fcdram":  2,
+}
+
+parser.add_option("--backend", type="choice",
+                  default="simdram",
+                  choices=list(BACKEND_SUBARRAYS.keys()),
+                  help="Row-op expansion backend: 'simdram' (Ambit AAP/AP, "
+                       "mirrors 94_simdram_schedule_runner_hbm.c) or 'fcdram' "
+                       "(COTS DDR4 ROWCLONE/AND_XSUB/OR_XSUB/NOT_XSUB, mirrors "
+                       "96_fcdram_schedule_runner_hbm.c). Default: simdram.")
+
 (options, args) = parser.parse_args()
 
 if not options.trace:
@@ -127,9 +149,14 @@ num_channels = total_banks // banks_per_channel
 row_stride = (int(tmp.device_rowbuffer_size.getValue()) *
               int(tmp.devices_per_rank.value))
 
-# Per-channel address space: ROWS_PER_SUBARRAY row-buffer rows per local bank.
-# Rounded up to the next power of 2 so DRAMCtrl geometry checks pass.
-channel_size_min = ROWS_PER_SUBARRAY * banks_per_channel * row_stride
+# Per-channel address space: subarrays_needed * ROWS_PER_SUBARRAY row-buffer
+# rows per local bank (rounded up to the next power of 2 so DRAMCtrl geometry
+# checks pass).  The FCDRAM backend needs 2 neighbouring subarrays per bank so
+# a compute row and its cross-subarray reference row are both addressable;
+# SIMDRAM needs only 1.  rows_per_bank = subarrays_needed * ROWS_PER_SUBARRAY
+# then stays a multiple of ROWS_PER_SUBARRAY, as DRAMCtrl requires.
+subarrays_needed = BACKEND_SUBARRAYS[options.backend]
+channel_size_min = subarrays_needed * ROWS_PER_SUBARRAY * banks_per_channel * row_stride
 channel_size = 1 << int(math.ceil(math.log(channel_size_min, 2)))
 
 base_addr = 0
@@ -176,7 +203,8 @@ system.player = RowOpTracePlayer(
     base_addr         = base_addr,
     banks_per_channel = banks_per_channel,
     channel_size      = channel_size,
-    row_stride        = row_stride)
+    row_stride        = row_stride,
+    backend           = options.backend)
 
 system.player.port = system.membus.slave
 system.system_port = system.membus.slave
@@ -201,6 +229,8 @@ print "  Banks/channel  : %d  (%d banks/rank x %d ranks)" % (
     int(tmp.banks_per_rank.value),
     int(tmp.ranks_per_channel.value))
 print "  Trace format   : %d-bank" % total_banks
+print "  Backend        : %s  (%d subarray(s)/bank)" % (
+    options.backend, subarrays_needed)
 print "  Channels       :", num_channels
 print "  Total banks    :", banks_per_channel * num_channels
 print "  Row stride     : %d B  (DRAM row buffer size)" % row_stride

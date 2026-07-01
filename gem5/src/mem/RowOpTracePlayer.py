@@ -31,4 +31,15 @@ class RowOpTracePlayer(MemObject):
     # For DDR4 this equals ROW_SIZE (8192); for HBM2/HBM3 it is 1024.
     row_stride = Param.Addr(8192, "DRAM row buffer size in bytes (row stride)")
 
+    # Row-op expansion backend: selects which PuD substrate the same CIMTRACE
+    # schedule is lowered onto.  Each backend mirrors one schedule-runner
+    # microworkload and emits a different DRAM row-op sequence:
+    #   "simdram" : Ambit AAP/AP triple-row ops   (94_simdram_schedule_runner_hbm.c)
+    #   "fcdram"  : COTS DDR4 cross-subarray gates (96_fcdram_schedule_runner_hbm.c)
+    # Adding a backend is local to rowop_trace_player.cc (parseBackend + the
+    # per-backend expand* implementations); see that file for the extension
+    # points.  The string is validated there, with a fatal() on an unknown name.
+    backend = Param.String("simdram",
+        "Row-op expansion backend name (e.g. 'simdram', 'fcdram')")
+
     system = Param.System(Parent.any, "System this player belongs to")

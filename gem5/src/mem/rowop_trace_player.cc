@@ -81,6 +81,24 @@ enum OpKind : uint8_t { OP_MULI = 0, OP_ADDI = 1, OP_ROW_COPY = 2 };
 // Constructor
 // ---------------------------------------------------------------------------
 
+// Out-of-class definition for the ODR-used static const member (passed by
+// reference to the variadic panic()/inform() helpers).
+const int RowOpTracePlayer::ROWS_PER_SUBARRAY;
+
+// ---------------------------------------------------------------------------
+// Backend name -> enum.  Central extension point: register a new backend's
+// name here (and add its expandAdd*/expandMul* implementations below).
+// ---------------------------------------------------------------------------
+RowOpTracePlayer::Backend
+RowOpTracePlayer::parseBackend(const std::string& name)
+{
+    if (name == "simdram") return BK_SIMDRAM;
+    if (name == "fcdram")  return BK_FCDRAM;
+    fatal("RowOpTracePlayer: unknown backend '%s' (expected 'simdram' or "
+          "'fcdram')", name.c_str());
+    return BK_SIMDRAM; // unreachable; silences -Wreturn-type
+}
+
 RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
     : MemObject(p),
       port("port", *this),
@@ -89,6 +107,7 @@ RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
       banksPerChannel(p->banks_per_channel),
       channelSize(p->channel_size),
       rowStride(p->row_stride),
+      backend(parseBackend(p->backend)),
       masterID(p->system->getMasterId(name())),
       currentOp(0),
       waitingResp(false),
@@ -244,11 +263,35 @@ RowOpTracePlayer::emitRowAdd(int lhs_slot, int rhs_slot, int out_slot,
 }
 
 // ---------------------------------------------------------------------------
-// execute_add  (mirrors C code in 93_simdram_schedule_runner.c)
+// Backend dispatchers.  loadTrace() calls these; each forwards to the
+// per-backend implementation.  Add a case here when introducing a backend.
 // ---------------------------------------------------------------------------
 void
 RowOpTracePlayer::expandAdd(int lhs_bw, int rhs_bw,
                              const std::vector<int>& banks)
+{
+    switch (backend) {
+      case BK_SIMDRAM: expandAddSimdram(lhs_bw, rhs_bw, banks); break;
+      case BK_FCDRAM:  expandAddFcdram (lhs_bw, rhs_bw, banks); break;
+    }
+}
+
+void
+RowOpTracePlayer::expandMul(int lhs_bw, int rhs_bw,
+                             const std::vector<int>& banks)
+{
+    switch (backend) {
+      case BK_SIMDRAM: expandMulSimdram(lhs_bw, rhs_bw, banks); break;
+      case BK_FCDRAM:  expandMulFcdram (lhs_bw, rhs_bw, banks); break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIMDRAM execute_add  (mirrors C code in 94_simdram_schedule_runner_hbm.c)
+// ---------------------------------------------------------------------------
+void
+RowOpTracePlayer::expandAddSimdram(int lhs_bw, int rhs_bw,
+                                    const std::vector<int>& banks)
 {
     int bw = std::min(lhs_bw, rhs_bw);
 
@@ -272,11 +315,11 @@ RowOpTracePlayer::expandAdd(int lhs_bw, int rhs_bw,
 }
 
 // ---------------------------------------------------------------------------
-// execute_mul  (mirrors C code in 93_simdram_schedule_runner.c)
+// SIMDRAM execute_mul  (mirrors C code in 94_simdram_schedule_runner_hbm.c)
 // ---------------------------------------------------------------------------
 void
-RowOpTracePlayer::expandMul(int lhs_bw, int rhs_bw,
-                             const std::vector<int>& banks)
+RowOpTracePlayer::expandMulSimdram(int lhs_bw, int rhs_bw,
+                                    const std::vector<int>& banks)
 {
     // Phase 1: init out[0] and partial[] from rhs[0]
     emitRowAnd(lhsBase + 0, rhsBase + 0, outBase + 0, banks);
@@ -315,6 +358,178 @@ RowOpTracePlayer::expandMul(int lhs_bw, int rhs_bw,
     emitRowAnd(lhsBase + lhs_bw - 1, rhsBase + rhs_bw - 1, tmpBase + 0, banks);
     emitRowAdd(tmpBase + 0, carryBase + 1, outBase + lhs_bw + rhs_bw - 2,
                carryBase + 0, outBase + lhs_bw + rhs_bw - 1, banks);
+}
+
+// ===========================================================================
+// FCDRAM backend (COTS DDR4 functionally-complete gates)
+//
+// Mirrors 96_fcdram_schedule_runner_hbm.c.  ADDI/MULI keep the exact same
+// bit-serial shift-add schedule as the SIMDRAM backend; only the bit-row AND
+// and full-adder primitives change, now built from ROWCLONE (intra-subarray
+// copy) and AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates).
+//
+// Cross-subarray gates require the compute (com/dst) row and its reference to
+// live in neighbouring subarrays of the same bank.  slotAddr() maps slot->row
+// linearly, so a slot's neighbouring-subarray mirror is slot + ROWS_PER_SUBARRAY
+// (same within-subarray offset => the APA activates exactly one row per
+// subarray, N=1, matching one bit-plane per bit-serial op).  This reproduces
+// the A-in-subarray-S / B-in-subarray-S+1 operand layout of the COTS
+// microworkloads (MIMDRAM_ext/microworkloads/{00_addition,31_and}_cots.c).
+//
+// Like the Ambit backend, this player models op *type/count/timing* only, not
+// functional results (the abstract-memory AAP/AP handlers are likewise no-ops).
+// The *_XSUB emitters therefore read the reference from the com row's own
+// mirror; the logical second operand named in the comments/parameters documents
+// intent and is not separately addressed.
+// ===========================================================================
+
+// ROWCLONE: dst <- src, intra-subarray copy (both slots in subarray 0).
+void
+RowOpTracePlayer::emitClone(int dst_slot, int src_slot,
+                             const std::vector<int>& banks)
+{
+    for (int b : banks)
+        pendingOps.push_back({Request::ROWCLONE,
+                              dst_slot, b, src_slot, b, 0, b});
+}
+
+// AND_XSUB: com = com AND ref, ref at com's neighbouring-subarray mirror.
+void
+RowOpTracePlayer::emitAndXsub(int com_slot, const std::vector<int>& banks)
+{
+    for (int b : banks)
+        pendingOps.push_back({Request::AND_XSUB,
+                              com_slot, b,
+                              com_slot + ROWS_PER_SUBARRAY, b, 0, b});
+}
+
+// OR_XSUB: com = com OR ref, ref at com's neighbouring-subarray mirror.
+void
+RowOpTracePlayer::emitOrXsub(int com_slot, const std::vector<int>& banks)
+{
+    for (int b : banks)
+        pendingOps.push_back({Request::OR_XSUB,
+                              com_slot, b,
+                              com_slot + ROWS_PER_SUBARRAY, b, 0, b});
+}
+
+// NOT_XSUB: dst = ~src, src at dst's neighbouring-subarray mirror.
+void
+RowOpTracePlayer::emitNotXsub(int dst_slot, const std::vector<int>& banks)
+{
+    for (int b : banks)
+        pendingOps.push_back({Request::NOT_XSUB,
+                              dst_slot, b,
+                              dst_slot + ROWS_PER_SUBARRAY, b, 0, b});
+}
+
+// execute_row_and:  out = lhs AND rhs   (ROWCLONE then AND_XSUB)
+void
+RowOpTracePlayer::emitRowAndFc(int lhs_slot, int rhs_slot, int out_slot,
+                                const std::vector<int>& banks)
+{
+    (void)rhs_slot; // reference operand; addressed via the com-row mirror
+    emitClone  (out_slot, lhs_slot, banks);  // out = lhs
+    emitAndXsub(out_slot,           banks);  // out = out AND rhs
+}
+
+// execute_row_add:  full adder built from COTS {AND,OR,NOT}_XSUB + ROWCLONE.
+//   out  = lhs ^ rhs ^ cin,   cout = MAJ(lhs, rhs, cin)
+// Comments state the intended value; staging rows match the C helper exactly
+// (B_T2=a&b, B_T0=a^b, B_T1=c&(a^b), B_T3=cout, B_DCC0=sum).
+void
+RowOpTracePlayer::emitRowAddFc(int lhs_slot, int rhs_slot, int out_slot,
+                                int cin_slot, int cout_slot,
+                                const std::vector<int>& banks)
+{
+    (void)rhs_slot; (void)cin_slot; // references; addressed via com-row mirrors
+
+    // a & b -> B_T2
+    emitClone  (SLOT_T2, lhs_slot, banks);   // B_T2 = a
+    emitAndXsub(SLOT_T2,           banks);   // B_T2 = a AND b
+
+    // axb = (a|b) & ~(a&b) -> B_T0
+    emitClone  (SLOT_T0, lhs_slot, banks);   // B_T0 = a
+    emitOrXsub (SLOT_T0,           banks);   // B_T0 = a OR b
+    emitNotXsub(SLOT_T3,           banks);   // B_T3 = ~(a AND b)
+    emitAndXsub(SLOT_T0,           banks);   // B_T0 = (a|b) AND ~(a&b) = a XOR b
+
+    // c & axb -> B_T1
+    emitClone  (SLOT_T1, SLOT_T0,  banks);   // B_T1 = axb
+    emitAndXsub(SLOT_T1,           banks);   // B_T1 = axb AND c
+
+    // cout = (a&b) | (c&axb) -> B_T3
+    emitClone  (SLOT_T3, SLOT_T2,  banks);   // B_T3 = a AND b
+    emitOrXsub (SLOT_T3,           banks);   // B_T3 = (a&b) OR (c&axb)
+
+    // sum = (axb|c) & ~(axb&c) -> B_DCC0
+    emitClone  (SLOT_DCC0, SLOT_T0, banks);  // B_DCC0 = axb
+    emitOrXsub (SLOT_DCC0,          banks);  // B_DCC0 = axb OR c
+    emitNotXsub(SLOT_T2,            banks);  // B_T2 = ~(c AND axb)
+    emitAndXsub(SLOT_DCC0,          banks);  // B_DCC0 = (axb|c) AND ~(axb&c) = sum
+
+    // commit
+    emitClone(out_slot,  SLOT_DCC0, banks);  // out  = sum
+    emitClone(cout_slot, SLOT_T3,   banks);  // cout = carry-out
+}
+
+// FCDRAM execute_add — ripple-carry adder (one full adder per bit).
+void
+RowOpTracePlayer::expandAddFcdram(int lhs_bw, int rhs_bw,
+                                   const std::vector<int>& banks)
+{
+    int bw = std::min(lhs_bw, rhs_bw);
+
+    // carry := 0 (B_DCC1 is the in-place ripple carry row)
+    emitClone(SLOT_DCC1, SLOT_C_0, banks);
+
+    for (int j = 0; j < bw; j++)
+        emitRowAddFc(lhsBase + j, rhsBase + j, outBase + j,
+                     SLOT_DCC1, SLOT_DCC1, banks);
+}
+
+// FCDRAM execute_mul — shift-add multiplier (schedule identical to SIMDRAM).
+void
+RowOpTracePlayer::expandMulFcdram(int lhs_bw, int rhs_bw,
+                                   const std::vector<int>& banks)
+{
+    // Phase 1: init out[0] and partial[] from rhs[0]
+    emitRowAndFc(lhsBase + 0, rhsBase + 0, outBase + 0, banks);
+
+    for (int i = 0; i < lhs_bw - 1; i++)
+        emitRowAndFc(lhsBase + i + 1, rhsBase + 0, partialBase + i, banks);
+
+    emitClone(carryBase + 1, SLOT_C_0, banks);   // carry[1] := 0
+
+    // Phase 2: accumulate rhs[1..rhs_bw-2]
+    for (int i = 0; i < rhs_bw - 1; i++) {
+        emitRowAndFc(lhsBase + 0, rhsBase + i, tmpBase + 0, banks);
+        emitRowAddFc(tmpBase + 0, partialBase + 0, outBase + i,
+                     SLOT_C_0,    carryBase + 0,   banks);
+
+        for (int j = 1; j < lhs_bw - 1; j++) {
+            emitRowAndFc(lhsBase + j, rhsBase + i, tmpBase + 0, banks);
+            emitRowAddFc(tmpBase + 0, partialBase + j, partialBase + j - 1,
+                         carryBase + 0, carryBase + 0, banks);
+        }
+
+        emitRowAndFc(lhsBase + lhs_bw - 1, rhsBase + i, tmpBase + 0, banks);
+        emitRowAddFc(tmpBase + 0, carryBase + 0, partialBase + lhs_bw - 2,
+                     carryBase + 1, carryBase + 1, banks);
+    }
+
+    // Phase 3: final row rhs[rhs_bw-1]
+    emitRowAndFc(lhsBase + 0, rhsBase + rhs_bw - 1, tmpBase + 0, banks);
+
+    for (int i = 1; i < lhs_bw - 1; i++) {
+        emitRowAndFc(lhsBase + i, rhsBase + rhs_bw - 1, tmpBase + 0, banks);
+        emitRowAddFc(tmpBase + 0, partialBase + i - 1, outBase + rhs_bw - 1 + i,
+                     carryBase + 0, carryBase + 0, banks);
+    }
+
+    emitRowAndFc(lhsBase + lhs_bw - 1, rhsBase + rhs_bw - 1, tmpBase + 0, banks);
+    emitRowAddFc(tmpBase + 0, carryBase + 1, outBase + lhs_bw + rhs_bw - 2,
+                 carryBase + 0, outBase + lhs_bw + rhs_bw - 1, banks);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,11 +652,14 @@ RowOpTracePlayer::loadTrace()
     carryBase   = tmpBase     + 1;
     int totalSlots = carryBase + 2;
 
-    inform("RowOpTracePlayer: %llu records, format=%d-bank, slots=%d (rows/bank)",
-           (unsigned long long)hdr.num_records, total_banks, totalSlots);
+    inform("RowOpTracePlayer: %llu records, format=%d-bank, backend=%s, "
+           "slots=%d (rows/bank)",
+           (unsigned long long)hdr.num_records, total_banks,
+           backend == BK_FCDRAM ? "fcdram" : "simdram", totalSlots);
 
-    if (totalSlots >= 512)
-        panic("RowOpTracePlayer: %d slots exceed rows_per_subarray (512)", totalSlots);
+    if (totalSlots >= ROWS_PER_SUBARRAY)
+        panic("RowOpTracePlayer: %d slots exceed rows_per_subarray (%d)",
+              totalSlots, ROWS_PER_SUBARRAY);
 
     // --- Expand records into PendingOps ---
     for (uint64_t i = 0; i < hdr.num_records; i++) {
