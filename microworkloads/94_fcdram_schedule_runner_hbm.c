@@ -1,0 +1,614 @@
+#define _POSIX_C_SOURCE 200112L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <m5op.h>
+#include "mimdram.h"
+
+/* -----------------------------------------------------------------------
+ * FCDRAM (COTS DDR4 PuD) schedule runner — 128-bank HBM variant.
+ *
+ * This runner is the FCDRAM counterpart of 94_simdram_schedule_runner_hbm.c.
+ * It consumes the *exact same* CIMTRACE binary schedule (same TraceHeader /
+ * 48-byte TraceRecord layout, same parser, same row pools, same main()).
+ * The ONLY difference is how ADDI and MULI are realised at the row-op level:
+ *
+ *   SIMDRAM runner : Ambit triple-row AAP/AP primitives (DCC-based NOT, MAJ3)
+ *   FCDRAM runner  : functionally-complete COTS DDR4 primitives validated in
+ *                    "Functionally-Complete Boolean Logic in Real DRAM Chips"
+ *                    -> AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates)
+ *                    -> ROWCLONE (intra-subarray copy)
+ *
+ * Bit-serial / transposed layout is unchanged: one bit-plane per DRAM row,
+ * elements laid out along the bitline, so each row-op is a SIMD gate over a
+ * whole bit-plane across all selected banks.
+ *
+ * Add  : ripple-carry full adder, one full-adder per bit position.
+ * Mul  : shift-add, identical schedule to the SIMDRAM runner, but every
+ *        bit-row AND / full-add is built from the COTS gates above.
+ *
+ * Because FCDRAM only exposes the {AND, OR, NOT} functionally-complete set
+ * (no native XOR / MAJ3 control row), the full adder is expanded as:
+ *     axb  = (a OR b) AND NOT(a AND b)            ; a XOR b
+ *     sum  = (axb OR c) AND NOT(axb AND c)        ; a XOR b XOR c
+ *     cout = (a AND b) OR (c AND axb)             ; MAJ(a,b,c)
+ * Each gate is in-place on its first operand (com = com OP ref), so we stage
+ * through control scratch rows B_T0..B_T3 and B_DCC0 (allocated by
+ * init_ambit). C_0 is used as the constant-0 row; gem5 SE zero-fills fresh
+ * pages, so C_0 reads as logic-0 without an explicit initialisation, exactly
+ * as in the SIMDRAM runner.
+ * --------------------------------------------------------------------- */
+#define HBM_BANKS 128
+#define HBM_ALIGNMENT ((size_t)ROW_SIZE * HBM_BANKS)
+#define BANKS HBM_BANKS
+
+#define BANK_ROW(ptr, bank)  ((void *)((char *)(ptr) + (bank) * ROW_SIZE))
+
+/* Inter-bank row copy (ROW_COPY records) — generic copy, not an arithmetic
+ * primitive, so it is shared verbatim with the SIMDRAM runner. */
+#define COPY_BANK_TO_BANK(dst, dst_bank, src, src_bank) \
+    rowop_copy(BANK_ROW((dst), (dst_bank)), BANK_ROW((src), (src_bank)))
+
+/* COTS DDR4 functionally-complete gates, single bank slot. */
+#define CLONE_ONE_BANK(dst, src, bank) \
+    rowop_rowclone(BANK_ROW((dst), (bank)), BANK_ROW((src), (bank)))
+#define AND_ONE_BANK(com, ref, bank) \
+    rowop_and_xsub(BANK_ROW((com), (bank)), BANK_ROW((ref), (bank)))
+#define OR_ONE_BANK(com, ref, bank) \
+    rowop_or_xsub(BANK_ROW((com), (bank)), BANK_ROW((ref), (bank)))
+#define NOT_ONE_BANK(dst, src, bank) \
+    rowop_not_xsub(BANK_ROW((dst), (bank)), BANK_ROW((src), (bank)))
+
+/* -----------------------------------------------------------------------
+ * Verbosity level (set via -v / -vv command-line flag):
+ *   0 = silent  (default, suitable for gem5 simulation)
+ *   1 = ops      show each time-step and operation group
+ *   2 = insns    additionally show every bit-serial instruction
+ * --------------------------------------------------------------------- */
+static int g_verbose = 0;
+
+/* -----------------------------------------------------------------------
+ * RowCopyTask
+ * --------------------------------------------------------------------- */
+typedef struct {
+    unsigned **src;
+    unsigned **dst;
+    int src_bank;
+    int dst_bank;
+    int bitwidth;
+} RowCopyTask;
+
+/* -----------------------------------------------------------------------
+ * Row allocator (identical to the SIMDRAM runner).
+ *
+ * All rows used in DRAM operations must be in the same subarray or the
+ * gem5 assertion fires. In gem5 SE mode, consecutive
+ * posix_memalign(ALIGNMENT, ALIGNMENT) calls produce physically-contiguous
+ * ALIGNMENT-sized blocks, so they all land in the same subarray as long as
+ * the total count stays below ROWS_PER_SUBARRAY (512).
+ *
+ * Shared-pool budget (independent of op mix):
+ *   control rows (init_ambit): 18
+ *   lhs + rhs + out + partial + tmp + carry: BW + BW + 2*BW + BW + 1 + 2
+ * => total = 18 + (5*BW + 3)
+ * SCHED_MAX_BW=64 -> 18 + 323 = 341 rows, still within 512.
+ *
+ * The FCDRAM full adder reuses control scratch rows B_T0..B_T3 and B_DCC0
+ * (all part of the 18 init_ambit control rows), so the budget is unchanged.
+ * --------------------------------------------------------------------- */
+static unsigned *alloc_vec_all_banks(void) {
+    unsigned *p = NULL;
+    if (posix_memalign((void **)&p, HBM_ALIGNMENT, HBM_ALIGNMENT)) {
+        fprintf(stderr, "alloc_vec_all_banks: out of memory\n");
+        exit(1);
+    }
+    return p;
+}
+
+/* -----------------------------------------------------------------------
+ * COTS gate helpers — apply one functionally-complete gate to a bit-plane
+ * across every selected bank slot.
+ * --------------------------------------------------------------------- */
+static inline void g_clone(unsigned *dst, unsigned *src,
+                           const int *bk, int n) {
+    for (int i = 0; i < n; i++) CLONE_ONE_BANK(dst, src, bk[i]);
+}
+static inline void g_and(unsigned *com, unsigned *ref,
+                         const int *bk, int n) {
+    for (int i = 0; i < n; i++) AND_ONE_BANK(com, ref, bk[i]);
+}
+static inline void g_or(unsigned *com, unsigned *ref,
+                        const int *bk, int n) {
+    for (int i = 0; i < n; i++) OR_ONE_BANK(com, ref, bk[i]);
+}
+static inline void g_not(unsigned *dst, unsigned *src,
+                         const int *bk, int n) {
+    for (int i = 0; i < n; i++) NOT_ONE_BANK(dst, src, bk[i]);
+}
+
+/* -----------------------------------------------------------------------
+ * Bit-serial primitives used by execute_add and execute_mul.
+ * --------------------------------------------------------------------- */
+
+/* out_bit = lhs_bit AND rhs_bit  (single COTS AND_XSUB after a copy). */
+static inline void execute_row_and(
+    unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit,
+    const int *bank_ids, int bank_count)
+{
+    g_clone(out_bit, lhs_bit, bank_ids, bank_count);   /* out = lhs        */
+    g_and  (out_bit, rhs_bit, bank_ids, bank_count);   /* out = lhs AND rhs */
+}
+
+/* Full adder:  out_bit = lhs ^ rhs ^ cin,  cout_bit = MAJ(lhs, rhs, cin).
+ *
+ * Inputs lhs/rhs are read only in the first stage; cin is read before any
+ * output is written, so cout_bit may safely alias cin_bit (in-place carry).
+ * Staging rows: B_T2=a&b, B_T0=a^b, B_T1=c&(a^b), B_T3=cout, B_DCC0=sum. */
+static inline void execute_row_add(
+    unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit,
+    unsigned *cin_bit, unsigned *cout_bit,
+    const int *bank_ids, int bank_count)
+{
+    const int *bk = bank_ids;
+    int n = bank_count;
+
+    /* a & b -> B_T2 */
+    g_clone(B_T2, lhs_bit, bk, n);
+    g_and  (B_T2, rhs_bit, bk, n);
+
+    /* axb = (a|b) & ~(a&b) -> B_T0 */
+    g_clone(B_T0, lhs_bit, bk, n);
+    g_or   (B_T0, rhs_bit, bk, n);
+    g_not  (B_T3, B_T2,    bk, n);   /* ~(a&b) */
+    g_and  (B_T0, B_T3,    bk, n);   /* a ^ b  */
+
+    /* c & axb -> B_T1 */
+    g_clone(B_T1, B_T0,    bk, n);
+    g_and  (B_T1, cin_bit, bk, n);
+
+    /* cout = (a&b) | (c&axb) -> B_T3 */
+    g_clone(B_T3, B_T2, bk, n);
+    g_or   (B_T3, B_T1, bk, n);
+
+    /* sum = (axb|c) & ~(axb&c) -> B_DCC0 */
+    g_clone(B_DCC0, B_T0,    bk, n);
+    g_or   (B_DCC0, cin_bit, bk, n);   /* axb | c    */
+    g_not  (B_T2,   B_T1,    bk, n);   /* ~(c & axb) */
+    g_and  (B_DCC0, B_T2,    bk, n);   /* axb ^ c    */
+
+    /* commit results (cin read is complete, so aliasing cout==cin is safe) */
+    g_clone(out_bit,  B_DCC0, bk, n);
+    g_clone(cout_bit, B_T3,   bk, n);
+}
+
+/* -----------------------------------------------------------------------
+ * Core execute_add — ripple-carry adder, one full adder per bit position.
+ * --------------------------------------------------------------------- */
+void execute_add(
+    int lhs_bw, int rhs_bw,
+    const int *bank_ids, int bank_count,
+    unsigned **lhs, unsigned **rhs, unsigned **out)
+{
+    int bw = (lhs_bw < rhs_bw) ? lhs_bw : rhs_bw;
+
+    /* carry := 0 (B_DCC1 used as the in-place carry row) */
+    g_clone(B_DCC1, C_0, bank_ids, bank_count);
+
+    for (int j = 0; j < bw; j++) {
+        if (g_verbose >= 2)
+            printf("      [bit=%d] full-adder: out[%d] = lhs[%d] + rhs[%d] + carry  ->  carry\n",
+                   j, j, j, j);
+        execute_row_add(lhs[j], rhs[j], out[j],
+                        B_DCC1, B_DCC1, bank_ids, bank_count);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Core execute_mul — shift-add multiplier.
+ *
+ * Algorithm and schedule are identical to the SIMDRAM runner; only the
+ * bit-row AND / full-add primitives differ (now COTS gates). C_0 is the
+ * constant-0 row (carry-in / carry seed).
+ * --------------------------------------------------------------------- */
+void execute_mul(
+    int lhs_bw, int rhs_bw,
+    const int *bank_ids, int bank_count,
+    unsigned **lhs, unsigned **rhs, unsigned **out,
+    unsigned **partial, unsigned **tmp, unsigned **carry)
+{
+    /* --- Phase 1: initialise out[0] and partial[] using rhs[0] --------- */
+    if (g_verbose >= 2)
+        printf("      [init]    AND  out[0] = lhs[0] & rhs[0]\n");
+    execute_row_and(lhs[0], rhs[0], out[0], bank_ids, bank_count);
+
+    for (int i = 0; i < lhs_bw - 1; i++) {
+        if (g_verbose >= 2)
+            printf("      [init]    AND  partial[%d] = lhs[%d] & rhs[0]\n", i, i + 1);
+        execute_row_and(lhs[i + 1], rhs[0], partial[i], bank_ids, bank_count);
+    }
+
+    g_clone(carry[1], C_0, bank_ids, bank_count);   /* carry[1] := 0 */
+
+    /* --- Phase 2: accumulate rhs[1..rhs_bw-2] -------------------------- */
+    for (int i = 0; i < rhs_bw - 1; i++) {
+        if (g_verbose >= 2)
+            printf("      [rhs=%d]   AND  tmp = lhs[0] & rhs[%d]\n", i, i);
+        execute_row_and(lhs[0], rhs[i], tmp[0], bank_ids, bank_count);
+
+        if (g_verbose >= 2)
+            printf("      [rhs=%d]   ADD  out[%d] = tmp + partial[0] + 0  ->carry[0]\n", i, i);
+        execute_row_add(tmp[0], partial[0], out[i], C_0, carry[0], bank_ids, bank_count);
+
+        for (int j = 1; j < lhs_bw - 1; j++) {
+            if (g_verbose >= 2)
+                printf("      [rhs=%d]   AND  tmp = lhs[%d] & rhs[%d]\n", i, j, i);
+            execute_row_and(lhs[j], rhs[i], tmp[0], bank_ids, bank_count);
+
+            if (g_verbose >= 2)
+                printf("      [rhs=%d]   ADD  partial[%d] = tmp + partial[%d] + carry[0]  ->carry[0]\n",
+                       i, j - 1, j);
+            execute_row_add(tmp[0], partial[j], partial[j - 1], carry[0], carry[0], bank_ids, bank_count);
+        }
+
+        if (g_verbose >= 2)
+            printf("      [rhs=%d]   AND  tmp = lhs[%d] & rhs[%d]\n", i, lhs_bw - 1, i);
+        execute_row_and(lhs[lhs_bw - 1], rhs[i], tmp[0], bank_ids, bank_count);
+
+        if (g_verbose >= 2)
+            printf("      [rhs=%d]   ADD  partial[%d] = tmp + carry[0] + carry[1]  ->carry[1]\n",
+                   i, lhs_bw - 2);
+        execute_row_add(tmp[0], carry[0], partial[lhs_bw - 2], carry[1], carry[1], bank_ids, bank_count);
+    }
+
+    /* --- Phase 3: final row rhs[rhs_bw-1] ------------------------------ */
+    if (g_verbose >= 2)
+        printf("      [final]   AND  tmp = lhs[0] & rhs[%d]\n", rhs_bw - 1);
+    execute_row_and(lhs[0], rhs[rhs_bw - 1], tmp[0], bank_ids, bank_count);
+
+    for (int i = 1; i < lhs_bw - 1; i++) {
+        if (g_verbose >= 2)
+            printf("      [final]   AND  tmp = lhs[%d] & rhs[%d]\n", i, rhs_bw - 1);
+        execute_row_and(lhs[i], rhs[rhs_bw - 1], tmp[0], bank_ids, bank_count);
+
+        if (g_verbose >= 2)
+            printf("      [final]   ADD  out[%d] = tmp + partial[%d] + carry[0]  ->carry[0]\n",
+                   rhs_bw - 1 + i, i - 1);
+        execute_row_add(tmp[0], partial[i - 1], out[rhs_bw - 1 + i], carry[0], carry[0], bank_ids, bank_count);
+    }
+
+    if (g_verbose >= 2)
+        printf("      [final]   AND  tmp = lhs[%d] & rhs[%d]\n", lhs_bw - 1, rhs_bw - 1);
+    execute_row_and(lhs[lhs_bw - 1], rhs[rhs_bw - 1], tmp[0], bank_ids, bank_count);
+
+    if (g_verbose >= 2)
+        printf("      [final]   ADD  out[%d] = tmp + carry[1] + carry[0]  ->out[%d]\n",
+               lhs_bw + rhs_bw - 2, lhs_bw + rhs_bw - 1);
+    execute_row_add(tmp[0], carry[1], out[lhs_bw + rhs_bw - 2], carry[0], out[lhs_bw + rhs_bw - 1], bank_ids, bank_count);
+}
+
+/* -----------------------------------------------------------------------
+ * Core execute_row_copy_batch
+ * --------------------------------------------------------------------- */
+void execute_row_copy_batch(const RowCopyTask *tasks, int task_count) {
+    if (!tasks || task_count <= 0) return;
+
+    int max_bw = 0;
+    for (int t = 0; t < task_count; t++) {
+        if (tasks[t].bitwidth > max_bw) max_bw = tasks[t].bitwidth;
+    }
+
+    for (int j = 0; j < max_bw; j++) {
+        if (g_verbose >= 2) {
+            printf("      [bit=%d]", j);
+            for (int t = 0; t < task_count; t++) {
+                if (j < tasks[t].bitwidth)
+                    printf("  COPY bank %d->%d", tasks[t].src_bank, tasks[t].dst_bank);
+            }
+            printf("\n");
+        }
+        for (int t = 0; t < task_count; t++) {
+            if (j >= tasks[t].bitwidth) continue;
+            COPY_BANK_TO_BANK(
+                tasks[t].dst[j], tasks[t].dst_bank,
+                tasks[t].src[j], tasks[t].src_bank);
+        }
+    }
+}
+
+/* =======================================================================
+ * Schedule runner
+ * ===================================================================== */
+
+#define SCHED_MAX_BANKS      HBM_BANKS
+
+/* Compile-time upper bound only; actual allocations are schedule-derived. */
+#define SCHED_MAX_BW         64
+
+typedef enum { OP_MULI = 0, OP_ADDI = 1, OP_ROW_COPY = 2 } OpType;
+
+typedef struct {
+    char     magic[8];
+    uint32_t version;
+    uint32_t record_size;
+    uint64_t num_records;
+    int64_t  last_end_time;
+} TraceHeader;
+
+/* 48-byte record: MULI/ADDI banks are a 128-bit mask (bit b => banks[b>>6]
+ * bit (b&63)); ROWCOPY uses src/dst (0..127). Must match the MLIR writer. */
+typedef struct {
+    int64_t  start;
+    int64_t  end;
+    uint64_t banks[2];
+    uint16_t lhs_bw;
+    uint16_t rhs_bw;
+    uint8_t  kind;
+    uint8_t  src;
+    uint8_t  dst;
+    uint8_t  pad[9];
+} TraceRecord;
+_Static_assert(sizeof(TraceHeader) == 32, "TraceHeader must be 32 bytes");
+_Static_assert(sizeof(TraceRecord) == 48, "TraceRecord must be 48 bytes");
+
+/* -----------------------------------------------------------------------
+ * Shared row pools used by both add and mul.
+ * All allocated from the subarray pool (see above).
+ * --------------------------------------------------------------------- */
+static unsigned *g_lhs    [SCHED_MAX_BW];
+static unsigned *g_rhs    [SCHED_MAX_BW];
+static unsigned *g_out    [2 * SCHED_MAX_BW];
+static unsigned *g_partial[SCHED_MAX_BW];
+static unsigned *g_tmp    [1];
+static unsigned *g_carry  [2];
+
+typedef struct {
+    int max_lhs_bw;
+    int max_rhs_bw;
+    int max_out_bw;
+    int max_partial_bw;
+} PoolWidths;
+
+static void init_pool_widths(PoolWidths *pw) {
+    memset(pw, 0, sizeof(*pw));
+}
+
+static int check_row_budget(const PoolWidths *pw) {
+    int pool_rows =
+        pw->max_lhs_bw + pw->max_rhs_bw + pw->max_out_bw + pw->max_partial_bw +
+        1 + 2; /* tmp + carry */
+    int total_rows = 18 + pool_rows; /* 18 ambit control rows */
+    if (total_rows > ROWS_PER_SUBARRAY) {
+        fprintf(stderr,
+                "schedule_runner: row budget overflow: need %d rows (including 18 control rows), "
+                "but ROWS_PER_SUBARRAY=%d\n",
+                total_rows, ROWS_PER_SUBARRAY);
+        return -1;
+    }
+    return 0;
+}
+
+static void alloc_row_pools(const PoolWidths *pw) {
+    for (int j = 0; j < pw->max_lhs_bw; j++) {
+        g_lhs[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_rhs_bw; j++) {
+        g_rhs[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_out_bw; j++) {
+        g_out[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_partial_bw; j++) {
+        g_partial[j]            = alloc_vec_all_banks();
+    }
+    g_tmp[0]   = alloc_vec_all_banks();
+    g_carry[0] = alloc_vec_all_banks();
+    g_carry[1] = alloc_vec_all_banks();
+}
+
+/* -----------------------------------------------------------------------
+ * Parser — only C standard library, no regex / strtok tricks.
+ * --------------------------------------------------------------------- */
+static int validate_record(const TraceRecord *rec) {
+    if (rec->kind > OP_ROW_COPY) return -1;
+    if (rec->end < rec->start) return -1;
+    if (rec->lhs_bw > SCHED_MAX_BW || rec->rhs_bw > SCHED_MAX_BW) return -1;
+    if (rec->kind == OP_ROW_COPY && (rec->src >= SCHED_MAX_BANKS || rec->dst >= SCHED_MAX_BANKS))
+        return -1;
+    return 0;
+}
+
+static int read_trace_header(FILE *f, TraceHeader *hdr) {
+    if (fread(hdr, sizeof(*hdr), 1, f) != 1) return -1;
+    if (memcmp(hdr->magic, "CIMTRACE", 8) != 0) return -1;
+    if (hdr->version != 1 || hdr->record_size != sizeof(TraceRecord)) return -1;
+    return 0;
+}
+
+static int bank_mask_to_ids(const uint64_t mask[2], int *bank_ids) {
+    int n = 0;
+    for (int b = 0; b < SCHED_MAX_BANKS; b++) {
+        if (mask[b >> 6] & (1ull << (b & 63))) bank_ids[n++] = b;
+    }
+    return n;
+}
+
+static void execute_trace_record(const TraceRecord *rec) {
+    if (rec->kind == OP_MULI || rec->kind == OP_ADDI) {
+        int bank_ids[SCHED_MAX_BANKS];
+        int bank_count = bank_mask_to_ids(rec->banks, bank_ids);
+
+        if (g_verbose >= 1) {
+            printf("  %s lhs=%-2u rhs=%-2u  banks:",
+                   rec->kind == OP_MULI ? "MULI" : "ADDI",
+                   rec->lhs_bw, rec->rhs_bw);
+            for (int k = 0; k < bank_count; k++) printf(" %d", bank_ids[k]);
+            printf("\n");
+        }
+
+        if (rec->kind == OP_MULI) {
+            execute_mul((int)rec->lhs_bw, (int)rec->rhs_bw,
+                        bank_ids, bank_count,
+                        g_lhs, g_rhs, g_out,
+                        g_partial, g_tmp, g_carry);
+        } else {
+            execute_add((int)rec->lhs_bw, (int)rec->rhs_bw,
+                        bank_ids, bank_count,
+                        g_lhs, g_rhs, g_out);
+        }
+    } else {
+        RowCopyTask task;
+        task.src = g_out;
+        task.dst = g_lhs;
+        task.src_bank = rec->src;
+        task.dst_bank = rec->dst;
+        task.bitwidth = rec->lhs_bw;
+
+        if (g_verbose >= 1) {
+            printf("  COPY  bank %d->%d (bw=%d)\n",
+                   task.src_bank, task.dst_bank, task.bitwidth);
+        }
+        execute_row_copy_batch(&task, 1);
+    }
+}
+
+static int derive_pool_widths_from_trace(const char *path, PoolWidths *pw, TraceHeader *out_hdr) {
+    init_pool_widths(pw);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    setvbuf(f, NULL, _IOFBF, 1 << 20);
+
+    TraceHeader hdr;
+    if (read_trace_header(f, &hdr) != 0) {
+        fprintf(stderr, "schedule_runner: invalid trace header in '%s'\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    for (uint64_t i = 0; i < hdr.num_records; i++) {
+        TraceRecord rec;
+        if (fread(&rec, sizeof(rec), 1, f) != 1) {
+            fprintf(stderr, "schedule_runner: truncated trace at record %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
+        }
+        if (validate_record(&rec) != 0) {
+            fprintf(stderr, "schedule_runner: invalid record at index %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
+        }
+
+        if (rec.kind == OP_MULI) {
+            if (rec.lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = rec.lhs_bw;
+            if (rec.rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = rec.rhs_bw;
+            if ((int)rec.lhs_bw + (int)rec.rhs_bw > pw->max_out_bw)
+                pw->max_out_bw = rec.lhs_bw + rec.rhs_bw;
+            if (rec.lhs_bw > pw->max_partial_bw) pw->max_partial_bw = rec.lhs_bw;
+        } else if (rec.kind == OP_ADDI) {
+            int add_bw = (rec.lhs_bw < rec.rhs_bw) ? rec.lhs_bw : rec.rhs_bw;
+            if (rec.lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = rec.lhs_bw;
+            if (rec.rhs_bw > pw->max_rhs_bw) pw->max_rhs_bw = rec.rhs_bw;
+            if (add_bw > pw->max_out_bw) pw->max_out_bw = add_bw;
+        } else {
+            if (rec.lhs_bw > pw->max_lhs_bw) pw->max_lhs_bw = rec.lhs_bw;
+        }
+    }
+
+    if (pw->max_lhs_bw > SCHED_MAX_BW || pw->max_rhs_bw > SCHED_MAX_BW ||
+        pw->max_partial_bw > SCHED_MAX_BW || pw->max_out_bw > 2 * SCHED_MAX_BW) {
+        fprintf(stderr, "schedule_runner: schedule bitwidth exceeds SCHED_MAX_BW=%d\n", SCHED_MAX_BW);
+        fclose(f);
+        return -1;
+    }
+
+    if (out_hdr) *out_hdr = hdr;
+    fclose(f);
+    return 0;
+}
+
+static int execute_trace_once(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    setvbuf(f, NULL, _IOFBF, 1 << 20);
+
+    TraceHeader hdr;
+    if (read_trace_header(f, &hdr) != 0) {
+        fprintf(stderr, "schedule_runner: invalid trace header in '%s'\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    int64_t current_start = 0;
+    int has_start = 0;
+
+    for (uint64_t i = 0; i < hdr.num_records; i++) {
+        TraceRecord rec;
+        if (fread(&rec, sizeof(rec), 1, f) != 1) {
+            fprintf(stderr, "schedule_runner: truncated trace at record %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
+        }
+        if (validate_record(&rec) != 0) {
+            fprintf(stderr, "schedule_runner: invalid record at index %llu\n",
+                    (unsigned long long)i);
+            fclose(f);
+            return -1;
+        }
+
+        if (!has_start || rec.start != current_start) {
+            current_start = rec.start;
+            has_start = 1;
+            if (g_verbose >= 1) printf("[t=%-4lld]\n", (long long)current_start);
+        }
+        execute_trace_record(&rec);
+    }
+    fclose(f);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * main
+ * --------------------------------------------------------------------- */
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <schedule.bin> [-v|-vv]\n", argv[0]);
+        return 1;
+    }
+
+    /* Parse optional verbosity flag (-v = ops, -vv = ops + insns) */
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-vv") == 0)      g_verbose = 2;
+        else if (strcmp(argv[i], "-v") == 0)  g_verbose = 1;
+    }
+
+    PoolWidths widths;
+    TraceHeader hdr;
+    if (derive_pool_widths_from_trace(argv[1], &widths, &hdr) != 0) return 1;
+    if (check_row_budget(&widths) != 0) return 1;
+
+    /* init_ambit() first (18 rows), then data rows — all via sequential
+     * posix_memalign(ALIGNMENT, ALIGNMENT) so they are physically contiguous
+     * and within a single DRAM subarray. */
+    init_ambit();
+    alloc_row_pools(&widths);
+
+    if (g_verbose >= 1) {
+        printf("Loaded trace '%s': records=%llu, last_end_time=%lld\n\n",
+               argv[1], (unsigned long long)hdr.num_records, (long long)hdr.last_end_time);
+    }
+
+    m5_reset_stats(0, 0);
+
+    if (execute_trace_once(argv[1]) != 0) return 1;
+
+    m5_dump_stats(0, 0);
+
+    if (g_verbose >= 1) printf("Done.\n");
+
+    return 0;
+}
