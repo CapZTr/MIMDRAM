@@ -15,13 +15,13 @@
 // ---------------------------------------------------------------------------
 // On-disk trace structures.
 //
-// Two binary formats exist, distinguished by TraceHeader::record_size:
+// The current CIMTRACE format has record_size == 48: a 128-bit bank bitmask
+// (uint64_t banks[2], bits 0..127), so it addresses up to 128 banks.  It is the
+// only format the Cinnamon compiler emits (94_simdram_schedule_runner.c /
+// 96_fcdram_schedule_runner.c consume the same file).
 //
-//   record_size == 32  ->  32-bank format  (93_simdram_schedule_runner.c)
-//                          banks field: uint32_t (bits 0..31)
-//
-//   record_size == 48  ->  128-bank format (94_simdram_schedule_runner_hbm.c)
-//                          banks field: uint64_t[2] (bits 0..127)
+// record_size == 32 is a legacy/obsolete format (uint32_t banks bitmask, bits
+// 0..31) kept only so old traces still replay -- no current writer produces it.
 //
 // After reading, both are normalised into NormRecord for uniform processing.
 // ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ struct TraceHeader {
 };
 static_assert(sizeof(TraceHeader) == 32, "TraceHeader size mismatch");
 
-// 32-bank on-disk record (record_size == 32)
+// Legacy/obsolete 32-bank on-disk record (record_size == 32; no longer emitted)
 struct TraceRecord32 {
     int64_t  start;
     int64_t  end;
@@ -157,19 +157,21 @@ RowOpTracePlayer::regStats()
 // ---------------------------------------------------------------------------
 // Address helper
 //
-//   global_bank ∈ [0, TOTAL_BANKS)   (always 32, matches mimdram.h)
+//   global_bank ∈ [0, total_banks)   (up to 128 for the current format;
+//                                      total_banks = banksPerChannel * channels)
 //   channel    = global_bank / banksPerChannel
 //   local_bank = global_bank % banksPerChannel
 //
 //   slot_addr = base + channel * channelSize
-//                    + (slot * banksPerChannel + local_bank) * ROW_SIZE
+//                    + (slot * banksPerChannel + local_bank) * rowStride
 //
-//   For DDR4 (banksPerChannel=32, channelSize unused):
-//     channel=0, local_bank=global_bank → base + (slot*32+bank)*ROW_SIZE  ✓
-//   For HBM2 (banksPerChannel=8, 4 channels):
+//   Examples for the 128-bank format (channels = 128 / banksPerChannel):
+//   For DDR4 (banksPerChannel=32, 4 channels):
+//     bank 0-31 → ch0 at base; bank 32-63 → ch1 at base+channelSize; …
+//   For HBM2 (banksPerChannel=8, 16 channels):
 //     bank 0-7 → ch0 at base; bank 8-15 → ch1 at base+channelSize; …
-//   For HBM3 (banksPerChannel=16, 2 channels):
-//     bank 0-15 → ch0 at base; bank 16-31 → ch1 at base+channelSize.
+//   For HBM3 (banksPerChannel=16, 8 channels):
+//     bank 0-15 → ch0 at base; bank 16-31 → ch1 at base+channelSize; …
 // ---------------------------------------------------------------------------
 
 Addr
@@ -237,7 +239,7 @@ void RowOpTracePlayer::emitCopy(int dst_slot, int dst_bank,
 }
 
 // ---------------------------------------------------------------------------
-// Composite emitters (match C helpers in 93_simdram_schedule_runner.c)
+// Composite emitters (match C helpers in 94_simdram_schedule_runner.c)
 // ---------------------------------------------------------------------------
 
 // execute_row_and: T0←lhs, T1←rhs, T2←C_0, out←T0∧T1∧T2
@@ -293,7 +295,7 @@ RowOpTracePlayer::expandMul(int lhs_bw, int rhs_bw,
 }
 
 // ---------------------------------------------------------------------------
-// SIMDRAM execute_add  (mirrors C code in 94_simdram_schedule_runner_hbm.c)
+// SIMDRAM execute_add  (mirrors C code in 94_simdram_schedule_runner.c)
 // ---------------------------------------------------------------------------
 void
 RowOpTracePlayer::expandAddSimdram(int lhs_bw, int rhs_bw,
@@ -321,7 +323,7 @@ RowOpTracePlayer::expandAddSimdram(int lhs_bw, int rhs_bw,
 }
 
 // ---------------------------------------------------------------------------
-// SIMDRAM execute_mul  (mirrors C code in 94_simdram_schedule_runner_hbm.c)
+// SIMDRAM execute_mul  (mirrors C code in 94_simdram_schedule_runner.c)
 // ---------------------------------------------------------------------------
 void
 RowOpTracePlayer::expandMulSimdram(int lhs_bw, int rhs_bw,
@@ -369,7 +371,7 @@ RowOpTracePlayer::expandMulSimdram(int lhs_bw, int rhs_bw,
 // ===========================================================================
 // FCDRAM backend (COTS DDR4 functionally-complete gates)
 //
-// Mirrors 96_fcdram_schedule_runner_hbm.c.  ADDI/MULI keep the exact same
+// Mirrors 96_fcdram_schedule_runner.c.  ADDI/MULI keep the exact same
 // bit-serial shift-add schedule as the SIMDRAM backend; only the bit-row AND
 // and full-adder primitives change, now built from ROWCLONE (intra-subarray
 // copy), AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates) and MAJ3 (native
@@ -595,7 +597,9 @@ RowOpTracePlayer::loadTrace()
         hdr.version != 1)
         panic("RowOpTracePlayer: invalid trace header in '%s'", traceFile.c_str());
 
-    // Detect format from record_size; derive total bank count.
+    // Detect format from record_size; derive total bank count.  The 48-byte
+    // record is the current format (up to 128 banks); the 32-byte record is a
+    // legacy/obsolete format kept only so old traces still replay.
     int total_banks;
     if (hdr.record_size == sizeof(TraceRecord32)) {
         total_banks = 32;

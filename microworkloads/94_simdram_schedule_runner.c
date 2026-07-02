@@ -8,20 +8,24 @@
 #include "mimdram.h"
  
 /* -----------------------------------------------------------------------
- * Architecture constants (HBM 128-bank variant)
+ * Architecture constants (128-bank CIMTRACE format).
  *
- * This runner consumes the 128-bank CIMTRACE format: MULI/ADDI banks are a
- * 128-bit mask (uint64_t banks[2]) and records are 48 bytes. One logical row
- * spans all HBM banks, so each pool allocation must cover HBM_BANKS row-slots
- * (BANK_ROW indexes p + bank*ROW_SIZE for bank in 0..HBM_BANKS-1).
+ * This runner consumes the CIMTRACE schedule format: MULI/ADDI banks are a
+ * 128-bit mask (uint64_t banks[2]) and records are 48 bytes, so the format
+ * addresses up to 128 banks (NUM_BANKS).  "128 banks" is a property of the
+ * trace format, not of any memory type: this runner is memory-type agnostic
+ * (it emits rowop_* primitives and never branches on DDR vs HBM).  One logical
+ * row spans all NUM_BANKS banks, so each pool allocation must cover NUM_BANKS
+ * row-slots (BANK_ROW indexes p + bank*ROW_SIZE for bank in 0..NUM_BANKS-1).
  *
- * NOTE: gem5 must be configured with the matching 128-bank vector geometry
- * (banks * ranks == HBM_BANKS) so the HBM_ALIGNMENT-aligned, sequential
- * posix_memalign allocations stay physically contiguous within a subarray.
+ * NOTE: gem5 must be configured so that NUM_BANKS banks are addressable
+ * (banks * ranks * channels == NUM_BANKS) and the BANK_VEC_ALIGNMENT-aligned,
+ * sequential posix_memalign allocations stay physically contiguous within a
+ * subarray.
  * --------------------------------------------------------------------- */
-#define HBM_BANKS 128
-#define HBM_ALIGNMENT ((size_t)ROW_SIZE * HBM_BANKS)
-#define BANKS HBM_BANKS
+#define NUM_BANKS 128   /* max banks in the CIMTRACE 128-bit bank-mask format */
+#define BANK_VEC_ALIGNMENT ((size_t)ROW_SIZE * NUM_BANKS)
+#define BANKS NUM_BANKS
 
 #define BANK_ROW(ptr, bank)  ((void *)((char *)(ptr) + (bank) * ROW_SIZE))
  
@@ -73,11 +77,11 @@ typedef struct {
  * --------------------------------------------------------------------- */
 static unsigned *alloc_vec_all_banks(void) {
     unsigned *p = NULL;
-    /* One logical row spans all HBM banks: BANK_ROW(p, bank) indexes bank-slot
-     * 0..HBM_BANKS-1 at p + bank*ROW_SIZE, so the allocation must cover
-     * HBM_BANKS row-slots (HBM_ALIGNMENT == ROW_SIZE * HBM_BANKS), aligned to
-     * the same so sequential allocations remain physically contiguous. */
-    if (posix_memalign((void **)&p, HBM_ALIGNMENT, HBM_ALIGNMENT)) {
+    /* One logical row spans all banks: BANK_ROW(p, bank) indexes bank-slot
+     * 0..NUM_BANKS-1 at p + bank*ROW_SIZE, so the allocation must cover
+     * NUM_BANKS row-slots (BANK_VEC_ALIGNMENT == ROW_SIZE * NUM_BANKS), aligned
+     * to the same so sequential allocations remain physically contiguous. */
+    if (posix_memalign((void **)&p, BANK_VEC_ALIGNMENT, BANK_VEC_ALIGNMENT)) {
         fprintf(stderr, "alloc_vec_all_banks: out of memory\n");
         exit(1);
     }
@@ -253,7 +257,7 @@ void execute_row_copy_batch(const RowCopyTask *tasks, int task_count) {
  * Schedule runner
  * ===================================================================== */
  
-#define SCHED_MAX_BANKS      HBM_BANKS
+#define SCHED_MAX_BANKS      NUM_BANKS
  
 /* Compile-time upper bound only; actual allocations are schedule-derived. */
 #define SCHED_MAX_BW         64

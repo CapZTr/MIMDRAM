@@ -21,10 +21,10 @@
  * Packets are sent one at a time (send → wait WriteResp → send next) so
  * the DRAM timing model runs without a CPU.
  *
- * Address layout for RoRaBaCoCh + DDR4_2400_x64 (banks/rank=16, ranks=2):
- *   ROW_SIZE     = 8192 B (macro from request.hh)
- *   ROWS_PER_VEC = 32     (banksPerRank * ranksPerChannel)
- *   ALIGNMENT    = 262144 B
+ * Address layout (example: RoRaBaCoCh + DDR4_2400_x64, banks/rank=16, ranks=2):
+ *   ROW_SIZE          = 8192 B (macro from request.hh)
+ *   banks_per_channel = 32     (banksPerRank * ranksPerChannel)
+ *   ALIGNMENT         = 262144 B
  *
  *   channel    = global_bank / banks_per_channel
  *   local_bank = global_bank % banks_per_channel
@@ -38,9 +38,11 @@
  *   decode assigns each (slot, local_bank) pair to the correct DRAM bank and
  *   keeps all slots within a single 512-row subarray.
  *
- *   DDR4 (banks_per_channel=32, 1 channel) : reduces to the original formula.
- *   HBM2 (banks_per_channel=8,  4 channels): global banks 0-7 → ch0, 8-15 → ch1, …
- *   HBM3 (banks_per_channel=16, 2 channels): global banks 0-15 → ch0, 16-31 → ch1.
+ *   The trace addresses up to 128 global banks (128-bit bank mask), split into
+ *   channels = 128 / banks_per_channel non-interleaved DRAMCtrls:
+ *     DDR4 (banks_per_channel=32) :  4 channels
+ *     HBM3 (banks_per_channel=16) :  8 channels
+ *     HBM2 (banks_per_channel=8)  : 16 channels
  *
  *   Slots 0-17 : ambit control rows (T0..C_1, matching init_ambit())
  *   Slots 18+  : data pools (lhs, rhs, out, partial, tmp, carry)
@@ -63,9 +65,11 @@ class RowOpTracePlayer : public MemObject
     };
 
     // ROW_SIZE = 8192 is already defined as a macro in request.hh.
-    // TOTAL_BANKS = 32 matches mimdram.h BANK_COUNT(16) * RANK_COUNT(2).
-    // Banks are partitioned across channels:
-    //   channel   = global_bank / banksPerChannel
+    // Legacy constant from the obsolete 32-bank format; the live bank count is
+    // derived per-trace (up to 128 for the current format) as
+    // banksPerChannel * num_channels, so this member is unused.  Kept only for
+    // reference.  Banks are partitioned across channels:
+    //   channel    = global_bank / banksPerChannel
     //   local_bank = global_bank % banksPerChannel
     static const int TOTAL_BANKS = 32;
 
@@ -83,8 +87,8 @@ class RowOpTracePlayer : public MemObject
     // per-backend expandAdd*/expandMul* pair dispatched by expandAdd/expandMul.
     // ------------------------------------------------------------------ //
     enum Backend {
-        BK_SIMDRAM,   // Ambit AAP/AP        (94_simdram_schedule_runner_hbm.c)
-        BK_FCDRAM     // COTS cross-subarray (96_fcdram_schedule_runner_hbm.c)
+        BK_SIMDRAM,   // Ambit AAP/AP        (94_simdram_schedule_runner.c)
+        BK_FCDRAM     // COTS cross-subarray (96_fcdram_schedule_runner.c)
     };
     static Backend parseBackend(const std::string& name);
 

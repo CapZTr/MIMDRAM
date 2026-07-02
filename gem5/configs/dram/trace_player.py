@@ -1,26 +1,34 @@
 """
 trace_player.py  --  replay a CIMTRACE binary against a bare DRAMCtrl
 
-Two CIMTRACE binary formats are supported, auto-detected from the header:
+CIMTRACE binary format (single, current):
+  32-byte header ("CIMTRACE", version=1, record_size=48, num_records,
+  last_end_time) followed by num_records x 48-byte records.  Each record
+  carries a 128-bit bank bitmask (banks[2]), so the format addresses up to
+  128 banks.  This is the only format the Cinnamon compiler emits.
+  (A legacy 32-byte/32-bank format is still auto-detected so old traces
+   replay -- no current writer produces it; see the record_size block below.)
 
-  record_size==32: 32-bank format  (93_simdram_schedule_runner.c)
-  record_size==48: 128-bank format (94_simdram_schedule_runner_hbm.c)
+The trace is memory-type agnostic: it names up to 128 global bank indices and
+says nothing about DDR vs HBM.  Two things are chosen independently on the CLI:
 
-Memory type to channel mapping:
+  --mem-type  DRAM device/timing model.  Only sets banks_per_channel =
+              banks_per_rank x ranks_per_channel; the player then instantiates
+              num_channels = total_banks / banks_per_channel non-interleaved
+              DRAMCtrls so all total_banks banks are addressable.  For the
+              128-bank format:
+                DDR4_2400_x64 : 32 banks/ch x  4 channels
+                HBM3_*_x64    : 16 banks/ch x  8 channels
+                HBM2_*_x64    :  8 banks/ch x 16 channels
 
-  32-bank traces:
-    DDR4_2400_x64 : 32 banks/ch x 1 channel
-    HBM3_*_x64   : 16 banks/ch x 2 channels
-    HBM2_*_x64   :  8 banks/ch x 4 channels
-
-  128-bank traces:
-    HBM3_*_x64   : 16 banks/ch x 8 channels
-    HBM2_*_x64   :  8 banks/ch x 16 channels
+  --backend   Row-op expansion substrate (see BACKEND_SUBARRAYS below).
+                simdram : runs on DDR or HBM
+                fcdram  : DDR only (COTS DDR4 cross-subarray gates)
 
 Usage:
   gem5.opt configs/dram/trace_player.py --trace=microworkloads/trace.bin
-  gem5.opt configs/dram/trace_player.py --trace=... --mem-type=HBM2_4Gb_x64
   gem5.opt configs/dram/trace_player.py --trace=... --mem-type=HBM3_4Gb_x64
+  gem5.opt configs/dram/trace_player.py --trace=... --backend=fcdram --mem-type=DDR4_2400_x64
 """
 
 import math
@@ -54,9 +62,10 @@ parser.add_option("--trace", type="string", default="",
 parser.add_option("--mem-type", type="choice",
                   default="DDR4_2400_x64",
                   choices=MemConfig.mem_names(),
-                  help="DRAM type (default: DDR4_2400_x64). "
-                       "banks_per_rank * ranks_per_channel must divide "
-                       "the trace total_banks (32 or 128).")
+                  help="DRAM type (default: DDR4_2400_x64). Independent of the "
+                       "trace; banks_per_rank * ranks_per_channel must divide "
+                       "the trace's total bank count (128 for the current "
+                       "format). The fcdram backend requires a DDR type.")
 
 parser.add_option("--addr-map", type="string", default="",
                   help="Override addr_mapping (e.g. RoRaBaCoCh, RoRaBaChCo). "
@@ -80,9 +89,10 @@ parser.add_option("--backend", type="choice",
                   default="simdram",
                   choices=list(BACKEND_SUBARRAYS.keys()),
                   help="Row-op expansion backend: 'simdram' (Ambit AAP/AP, "
-                       "mirrors 94_simdram_schedule_runner_hbm.c) or 'fcdram' "
-                       "(COTS DDR4 ROWCLONE/AND_XSUB/OR_XSUB/NOT_XSUB, mirrors "
-                       "96_fcdram_schedule_runner_hbm.c). Default: simdram.")
+                       "mirrors 94_simdram_schedule_runner.c; runs on DDR or "
+                       "HBM) or 'fcdram' (COTS DDR4 ROWCLONE/AND_XSUB/OR_XSUB/"
+                       "NOT_XSUB/MAJ3, mirrors 96_fcdram_schedule_runner.c; "
+                       "DDR only). Default: simdram.")
 
 (options, args) = parser.parse_args()
 
@@ -94,9 +104,10 @@ if args:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Auto-detect total bank count from the trace header.
-#   record_size == 32  ->  32-bank format  (uint32_t banks bitmask)
-#   record_size == 48  ->  128-bank format (uint64_t banks[2] bitmask)
+# Read the total bank count from the trace header's record_size field.
+#   record_size == 48  ->  current format, 128-bit bank mask (up to 128 banks)
+#   record_size == 32  ->  legacy format,  32-bit bank mask  (obsolete; kept
+#                          only so old traces still replay -- no writer emits it)
 # ---------------------------------------------------------------------------
 
 try:
@@ -111,10 +122,10 @@ if len(_hdr) < 32 or _hdr[:8] != 'CIMTRACE':
     sys.exit(1)
 
 _record_size = struct.unpack_from('<I', _hdr, 12)[0]
-if _record_size == 32:
-    total_banks = 32
-elif _record_size == 48:
-    total_banks = 128
+if _record_size == 48:
+    total_banks = 128            # current format
+elif _record_size == 32:
+    total_banks = 32             # legacy/obsolete format
 else:
     print "Error: unrecognised record_size=%d in '%s'" % (_record_size, options.trace)
     sys.exit(1)

@@ -8,9 +8,14 @@
 #include "mimdram.h"
 
 /* -----------------------------------------------------------------------
- * FCDRAM (COTS DDR4 PuD) schedule runner — 128-bank HBM variant.
+ * FCDRAM (COTS DDR4 PuD) schedule runner — 128-bank CIMTRACE format.
  *
- * This runner is the FCDRAM counterpart of 94_simdram_schedule_runner_hbm.c.
+ * "128 banks" is a property of the trace format (128-bit bank mask), not of
+ * any memory type; this runner never branches on DDR vs HBM.  The FCDRAM
+ * substrate itself is DDR-only (COTS DDR4 cross-subarray gates), so in gem5 it
+ * is replayed against a DDR memory model.
+ *
+ * This runner is the FCDRAM counterpart of 94_simdram_schedule_runner.c.
  * It consumes the *exact same* CIMTRACE binary schedule (same TraceHeader /
  * 48-byte TraceRecord layout, same parser, same row pools, same main()).
  * The ONLY difference is how ADDI and MULI are realised at the row-op level:
@@ -43,9 +48,9 @@
  * the constant-0 row; gem5 SE zero-fills fresh pages, so C_0 reads as logic-0
  * without an explicit initialisation, exactly as in the SIMDRAM runner.
  * --------------------------------------------------------------------- */
-#define HBM_BANKS 128
-#define HBM_ALIGNMENT ((size_t)ROW_SIZE * HBM_BANKS)
-#define BANKS HBM_BANKS
+#define NUM_BANKS 128   /* max banks in the CIMTRACE 128-bit bank-mask format */
+#define BANK_VEC_ALIGNMENT ((size_t)ROW_SIZE * NUM_BANKS)
+#define BANKS NUM_BANKS
 
 #define BANK_ROW(ptr, bank)  ((void *)((char *)(ptr) + (bank) * ROW_SIZE))
 
@@ -105,7 +110,7 @@ typedef struct {
  * --------------------------------------------------------------------- */
 static unsigned *alloc_vec_all_banks(void) {
     unsigned *p = NULL;
-    if (posix_memalign((void **)&p, HBM_ALIGNMENT, HBM_ALIGNMENT)) {
+    if (posix_memalign((void **)&p, BANK_VEC_ALIGNMENT, BANK_VEC_ALIGNMENT)) {
         fprintf(stderr, "alloc_vec_all_banks: out of memory\n");
         exit(1);
     }
@@ -332,7 +337,7 @@ void execute_row_copy_batch(const RowCopyTask *tasks, int task_count) {
  * Schedule runner
  * ===================================================================== */
 
-#define SCHED_MAX_BANKS      HBM_BANKS
+#define SCHED_MAX_BANKS      NUM_BANKS
 
 /* Compile-time upper bound only; actual allocations are schedule-derived. */
 #define SCHED_MAX_BW         64
