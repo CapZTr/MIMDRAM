@@ -94,6 +94,15 @@ parser.add_option("--backend", type="choice",
                        "NOT_XSUB/MAJ3, mirrors 96_fcdram_schedule_runner.c; "
                        "DDR only). Default: simdram.")
 
+parser.add_option("--all-bank", action="store_true", default=False,
+                  help="Model all-bank parallelism: an ADDI/MULI record's SIMD "
+                       "op over its bank mask is a single all-bank broadcast per "
+                       "channel, so it costs one bank's op-time (one "
+                       "representative bank per channel is simulated) instead of "
+                       "serializing every bank. Mirrors OptiPIM's single_bank_opt "
+                       "and makes the runtime comparable to OptiPIM. Default off "
+                       "(legacy per-bank, channel-serialized).")
+
 (options, args) = parser.parse_args()
 
 if not options.trace:
@@ -215,7 +224,8 @@ system.player = RowOpTracePlayer(
     banks_per_channel = banks_per_channel,
     channel_size      = channel_size,
     row_stride        = row_stride,
-    backend           = options.backend)
+    backend           = options.backend,
+    bank_parallel     = options.all_bank)
 
 system.player.port = system.membus.slave
 system.system_port = system.membus.slave
@@ -242,6 +252,9 @@ print "  Banks/channel  : %d  (%d banks/rank x %d ranks)" % (
 print "  Trace format   : %d-bank" % total_banks
 print "  Backend        : %s  (%d subarray(s)/bank)" % (
     options.backend, subarrays_needed)
+print "  Bank mode      : %s" % (
+    "all-bank parallel (1 rep bank/channel)" if options.all_bank
+    else "per-bank (channel-serialized)")
 print "  Channels       :", num_channels
 print "  Total banks    :", banks_per_channel * num_channels
 print "  Row stride     : %d B  (DRAM row buffer size)" % row_stride

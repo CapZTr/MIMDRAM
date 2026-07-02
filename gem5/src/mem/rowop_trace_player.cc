@@ -110,6 +110,7 @@ RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
       channelSize(p->channel_size),
       rowStride(p->row_stride),
       backend(parseBackend(p->backend)),
+      bankParallel(p->bank_parallel),
       masterID(p->system->getMasterId(name())),
       curGroup(0), issueIdx(0), completedCount(0),
       retryPkt(nullptr),
@@ -690,19 +691,37 @@ RowOpTracePlayer::loadTrace()
     for (uint64_t i = 0; i < hdr.num_records; i++) {
         const NormRecord& r = records[i];
 
-        // Build global bank list from 128-bit bitmask.
+        // Build global bank list from 128-bit bitmask (ascending order).
         std::vector<int> banks;
         for (int b = 0; b < total_banks; b++)
             if (r.banks[b >> 6] & (1ull << (b & 63)))
                 banks.push_back(b);
 
+        // All-bank mode: an ADDI/MULI record runs the SAME row-op on the SAME
+        // rows across every bank in its mask (SIMD), which real PuD hardware
+        // issues as ONE all-bank broadcast command per channel -- one bank's
+        // op-time, not one per bank.  Keep a single representative bank per
+        // channel so bank count no longer inflates the makespan (channels are
+        // independent DRAMCtrls and stay parallel).  Mirrors OptiPIM's
+        // single_bank_opt.  `banks` is ascending, so banks of one channel are
+        // contiguous and we can dedup channels with a running last-channel id.
+        std::vector<int> collapsed;
+        if (bankParallel) {
+            int lastCh = -1;
+            for (int b : banks) {
+                int ch = b / banksPerChannel;
+                if (ch != lastCh) { collapsed.push_back(b); lastCh = ch; }
+            }
+        }
+        const std::vector<int>& compBanks = bankParallel ? collapsed : banks;
+
         size_t before = pendingOps.size();
         switch (r.kind) {
           case OP_ADDI:
-            expandAdd(r.lhs_bw, r.rhs_bw, banks);
+            expandAdd(r.lhs_bw, r.rhs_bw, compBanks);
             break;
           case OP_MULI:
-            expandMul(r.lhs_bw, r.rhs_bw, banks);
+            expandMul(r.lhs_bw, r.rhs_bw, compBanks);
             break;
           case OP_ROW_COPY:
             expandRowCopy(r.lhs_bw, r.src, r.dst);

@@ -134,6 +134,7 @@ class RowOpTracePlayer : public MemObject
     const Addr        channelSize;     // byte stride between channel base addrs
     const Addr        rowStride;       // DRAM row buffer size (address stride per slot)
     const Backend     backend;         // row-op expansion backend (see enum Backend)
+    const bool        bankParallel;    // all-bank mode: 1 rep bank/channel (see .py)
     MasterID          masterID;
 
     // ------------------------------------------------------------------ //
