@@ -95,14 +95,15 @@ parser.add_option("--backend", type="choice",
                        "NOT_XSUB/MAJ3, mirrors 96_fcdram_schedule_runner.c; "
                        "DDR only). Default: simdram.")
 
-parser.add_option("--all-bank", action="store_true", default=False,
-                  help="Model all-bank parallelism: an ADDI/MULI record's SIMD "
+parser.add_option("--single-bank", action="store_true", default=False,
+                  help="Single-bank optimization: an ADDI/MULI record's SIMD "
                        "op over its bank mask is a single all-bank broadcast per "
                        "channel, so it costs one bank's op-time (one "
                        "representative bank per channel is simulated) instead of "
-                       "serializing every bank. Mirrors OptiPIM's single_bank_opt "
-                       "and makes the runtime comparable to OptiPIM. Default off "
-                       "(legacy per-bank, channel-serialized).")
+                       "emitting every bank's packets. Same name and semantics "
+                       "as OptiPIM's single_bank_opt, making the runtime "
+                       "comparable to OptiPIM. Default off (full per-bank "
+                       "emission).")
 
 parser.add_option("--max-tick", type="long", default=0,
                   help="Stop the simulation after this many ticks (0 = run to "
@@ -244,7 +245,7 @@ system.player = RowOpTracePlayer(
     channel_size      = channel_size,
     row_stride        = row_stride,
     backend           = options.backend,
-    bank_parallel     = options.all_bank,
+    single_bank_opt   = options.single_bank,
     per_channel       = options.per_channel)
 
 # Single-port path is always bound (idle in per-channel mode).
@@ -279,8 +280,8 @@ print "  Trace format   : %d-bank" % total_banks
 print "  Backend        : %s  (%d subarray(s)/bank)" % (
     options.backend, subarrays_needed)
 print "  Bank mode      : %s" % (
-    "all-bank parallel (1 rep bank/channel)" if options.all_bank
-    else "per-bank (channel-serialized)")
+    "single-bank opt (1 rep bank/channel)" if options.single_bank
+    else "full emission (per-bank packets)")
 print "  Issue engine   : %s" % (
     "per-channel (independent retry/channel)" if options.per_channel
     else "single-port")

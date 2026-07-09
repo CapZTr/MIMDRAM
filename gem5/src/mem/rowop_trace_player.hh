@@ -166,7 +166,7 @@ class RowOpTracePlayer : public MemObject
     const Addr        channelSize;     // byte stride between channel base addrs
     const Addr        rowStride;       // DRAM row buffer size (address stride per slot)
     const Backend     backend;         // row-op expansion backend (see enum Backend)
-    const bool        bankParallel;    // all-bank mode: 1 rep bank/channel (see .py)
+    const bool        singleBank;      // single-bank opt: 1 rep bank/channel (see .py)
     // FCDRAM: compute/data rows live in the MIDDLE of 3 subarrays so both
     // cross-subarray neighbours (slot ± ROWS_PER_SUBARRAY) are addressable;
     // slotAddr() adds this to every slot.  0 for single-subarray backends.

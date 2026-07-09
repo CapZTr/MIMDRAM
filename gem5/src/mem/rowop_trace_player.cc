@@ -112,7 +112,7 @@ RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
       channelSize(p->channel_size),
       rowStride(p->row_stride),
       backend(parseBackend(p->backend)),
-      bankParallel(p->bank_parallel),
+      singleBank(p->single_bank_opt),
       slotOffset(parseBackend(p->backend) == BK_FCDRAM ? ROWS_PER_SUBARRAY : 0),
       masterID(p->system->getMasterId(name())),
       curGroup(0), issueIdx(0), completedCount(0),
@@ -766,23 +766,24 @@ RowOpTracePlayer::loadTrace()
             if (r.banks[b >> 6] & (1ull << (b & 63)))
                 banks.push_back(b);
 
-        // All-bank mode: an ADDI/MULI record runs the SAME row-op on the SAME
-        // rows across every bank in its mask (SIMD), which real PuD hardware
-        // issues as ONE all-bank broadcast command per channel -- one bank's
-        // op-time, not one per bank.  Keep a single representative bank per
-        // channel so bank count no longer inflates the makespan (channels are
-        // independent DRAMCtrls and stay parallel).  Mirrors OptiPIM's
-        // single_bank_opt.  `banks` is ascending, so banks of one channel are
-        // contiguous and we can dedup channels with a running last-channel id.
+        // Single-bank opt: an ADDI/MULI record runs the SAME row-op on the
+        // SAME rows across every bank in its mask (SIMD), which real PuD
+        // hardware issues as ONE all-bank broadcast command per channel --
+        // one bank's op-time, not one per bank.  Keep a single representative
+        // bank per channel so bank count no longer inflates the makespan
+        // (channels are independent DRAMCtrls and stay parallel).  Same name
+        // and semantics as OptiPIM's single_bank_opt.  `banks` is ascending,
+        // so banks of one channel are contiguous and we can dedup channels
+        // with a running last-channel id.
         std::vector<int> collapsed;
-        if (bankParallel) {
+        if (singleBank) {
             int lastCh = -1;
             for (int b : banks) {
                 int ch = b / banksPerChannel;
                 if (ch != lastCh) { collapsed.push_back(b); lastCh = ch; }
             }
         }
-        const std::vector<int>& compBanks = bankParallel ? collapsed : banks;
+        const std::vector<int>& compBanks = singleBank ? collapsed : banks;
 
         size_t before = pendingOps.size();
         switch (r.kind) {

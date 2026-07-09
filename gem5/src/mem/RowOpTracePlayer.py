@@ -55,18 +55,20 @@ class RowOpTracePlayer(MemObject):
     backend = Param.String("simdram",
         "Row-op expansion backend name (e.g. 'simdram', 'fcdram')")
 
-    # All-bank parallelism.  An ADDI/MULI record runs the SAME row-op on the
-    # SAME rows across every bank in its 128-bit mask (SIMD); real PuD hardware
-    # issues that as ONE all-bank broadcast command per channel, so it costs one
-    # bank's op-time, not one per bank.  When True the player keeps a single
-    # representative bank per channel for those records, so bank count no longer
-    # inflates the makespan (channels are independent DRAMCtrls and stay
-    # parallel).  This mirrors OptiPIM's single_bank_opt and is what makes the
-    # gem5 row-op runtime comparable to OptiPIM.  Default False preserves the
-    # legacy per-bank (channel-serialized) behaviour.  ROWCOPY is unaffected: it
-    # addresses specific src/dst banks, not the mask.
-    bank_parallel = Param.Bool(False,
-        "Model all-bank parallelism (one representative bank per channel for "
-        "ADDI/MULI); False = legacy per-bank serialization")
+    # Single-bank optimization.  An ADDI/MULI record runs the SAME row-op on
+    # the SAME rows across every bank in its 128-bit mask (SIMD); real PuD
+    # hardware issues that as ONE all-bank broadcast command per channel, so it
+    # costs one bank's op-time, not one per bank.  When True the player keeps a
+    # single representative bank per channel for those records, so bank count
+    # no longer inflates the makespan (channels are independent DRAMCtrls and
+    # stay parallel).  Same name and semantics as OptiPIM's single_bank_opt,
+    # which is what makes the gem5 row-op runtime comparable to OptiPIM.
+    # Default False = full emission: every bank in the mask gets its own
+    # packets.  ROWCOPY is unaffected either way: it addresses specific
+    # src/dst banks, not the mask.
+    single_bank_opt = Param.Bool(False,
+        "Collapse each ADDI/MULI record to one representative bank per "
+        "channel (all-bank broadcast credit, mirrors OptiPIM's "
+        "single_bank_opt); False = full per-bank emission")
 
     system = Param.System(Parent.any, "System this player belongs to")
