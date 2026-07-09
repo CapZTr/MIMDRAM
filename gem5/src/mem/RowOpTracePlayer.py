@@ -49,6 +49,8 @@ class RowOpTracePlayer(MemObject):
     #               runs on DDR or HBM)
     #   "fcdram"  : COTS DDR4 cross-subarray gates (96_fcdram_schedule_runner.c;
     #               DDR only)
+    #   "prada"   : SRA TRA/N/5RA row-ops          (95_prada_schedule_runner.c;
+    #               runs on DDR or HBM)
     # Adding a backend is local to rowop_trace_player.cc (parseBackend + the
     # per-backend expand* implementations); see that file for the extension
     # points.  The string is validated there, with a fatal() on an unknown name.

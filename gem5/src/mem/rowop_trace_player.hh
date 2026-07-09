@@ -95,7 +95,8 @@ class RowOpTracePlayer : public MemObject
     // ------------------------------------------------------------------ //
     enum Backend {
         BK_SIMDRAM,   // Ambit AAP/AP        (94_simdram_schedule_runner.c)
-        BK_FCDRAM     // COTS cross-subarray (96_fcdram_schedule_runner.c)
+        BK_FCDRAM,    // COTS cross-subarray (96_fcdram_schedule_runner.c)
+        BK_PRADA      // SRA: TRA + N + 5RA  (95_prada_schedule_runner.c)
     };
     static Backend parseBackend(const std::string& name);
 
@@ -276,6 +277,30 @@ class RowOpTracePlayer : public MemObject
     void emitRowAddFc(int lhs_slot, int rhs_slot, int out_slot,
                       int cin_slot, int cout_slot,
                       const std::vector<int>& banks);
+
+    // --- PRADA backend (PRADA, ICCAD'24: Sequential Row Activation) ---- //
+    // Same bit-serial shift-add schedule as SIMDRAM, but the bit-row AND and
+    // full-adder are built from PRADA's distinctive row-ops instead of Ambit
+    // AAP chains: TRA (3-row majority, ROWAAAP), the single-command NOT (N,
+    // ROWANAP; no DCC) and 5RA (5-row majority, ROWAAAAAP).  No new gem5
+    // primitive is needed -- these ops already exist with faithful timing.
+    void expandAddPrada(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
+    void expandMulPrada(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
+
+    // PRADA primitive emitters (per single bank).  ROWAAAP = A A As P (a
+    // 3-activation sequence: TRA majority OR a two-destination copy -- same
+    // timing either way).  ROWANAP = As N A P (sense, invert, copy).
+    // ROWAAAAAP = A A A A As P (5-activation 5-row majority).
+    void emitAAAP  (int dst_slot, int src1_slot, int src2_slot, int bank);
+    void emitANAP  (int dst_slot, int src_slot,                 int bank);
+    void emitAAAAAP(int dst_slot, int src1_slot, int src2_slot, int bank);
+
+    // PRADA multi-bank composite emitters (mirror the C helpers in 95_...)
+    void emitRowAndPrada(int lhs_slot, int rhs_slot, int out_slot,
+                         const std::vector<int>& banks);
+    void emitRowAddPrada(int lhs_slot, int rhs_slot, int out_slot,
+                         int cin_slot, int cout_slot,
+                         const std::vector<int>& banks);
 
     // Address + packet helpers
     Addr      slotAddr(int slot, int bank) const;

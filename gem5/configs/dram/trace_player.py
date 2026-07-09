@@ -24,6 +24,7 @@ says nothing about DDR vs HBM.  Two things are chosen independently on the CLI:
   --backend   Row-op expansion substrate (see BACKEND_SUBARRAYS below).
                 simdram : runs on DDR or HBM
                 fcdram  : DDR only (COTS DDR4 cross-subarray gates)
+                prada   : runs on DDR or HBM (SRA: TRA / single-command NOT / 5RA)
 
 Usage:
   gem5.opt configs/dram/trace_player.py --trace=microworkloads/trace.bin
@@ -78,12 +79,14 @@ parser.add_option("--addr-map", type="string", default="",
 #   fcdram  : compute rows in the middle subarray, reference
 #             rows in BOTH neighbouring subarrays (open-bitline
 #             half-row coverage needs one APA per side)         (96_...)
+#   prada   : TRA/N/5RA, all rows in one subarray               (95_...)
 # To add a backend: register its name -> subarray count here and add the
 # matching expand* implementation in src/mem/rowop_trace_player.cc.
 # ---------------------------------------------------------------------------
 BACKEND_SUBARRAYS = {
     "simdram": 1,
     "fcdram":  3,
+    "prada":   1,
 }
 
 parser.add_option("--backend", type="choice",
@@ -91,9 +94,12 @@ parser.add_option("--backend", type="choice",
                   choices=list(BACKEND_SUBARRAYS.keys()),
                   help="Row-op expansion backend: 'simdram' (Ambit AAP/AP, "
                        "mirrors 94_simdram_schedule_runner.c; runs on DDR or "
-                       "HBM) or 'fcdram' (COTS DDR4 ROWCLONE/AND_XSUB/OR_XSUB/"
+                       "HBM), 'fcdram' (COTS DDR4 ROWCLONE/AND_XSUB/OR_XSUB/"
                        "NOT_XSUB/MAJ3, mirrors 96_fcdram_schedule_runner.c; "
-                       "DDR only). Default: simdram.")
+                       "DDR only), or 'prada' (Sequential Row Activation: TRA/"
+                       "N/5RA via ROWAAAP/ROWANAP/ROWAAAAAP, mirrors "
+                       "95_prada_schedule_runner.c; runs on DDR or HBM). "
+                       "Default: simdram.")
 
 parser.add_option("--single-bank", action="store_true", default=False,
                   help="Single-bank optimization: an ADDI/MULI record's SIMD "

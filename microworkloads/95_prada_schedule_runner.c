@@ -1,30 +1,53 @@
 #define _POSIX_C_SOURCE 200112L
- 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <m5op.h>
 #include "mimdram.h"
- 
+
 /* -----------------------------------------------------------------------
- * Architecture constants
+ * PRADA schedule runner (PRADA, ICCAD'24: "A Processing-using-Memory
+ * Architecture for Commodity DRAM Devices with Enhanced Compatibility and
+ * Reliability").
+ *
+ * Consumes the same 128-bank CIMTRACE schedule format as the SIMDRAM and
+ * FCDRAM runners (94_/96_) and keeps the exact same bit-serial shift-add
+ * schedule.  Only the bit-row AND and the full-adder differ: PRADA's
+ * Sequential Row Activation lets it build them from three distinctive row-ops
+ * instead of Ambit AAP chains:
+ *
+ *   * TRA  (Triple Row Activation, ROWAAAP): 3-row charge-sharing majority
+ *     R = MAJ(a,b,c).  With c preset to 0 this is a AND b.  The same
+ *     3-activation sequence also serves as a two-destination copy.
+ *   * N    (single-command NOT, ROWANAP): invert on the sense amp (no DCC) and
+ *     copy the result to a second row.
+ *   * 5RA  (Five Row Activation, ROWAAAAAP): 5-row majority used for the sum,
+ *     S = MAJ(a, b, cin, ~C, ~C).
+ *
+ * This runner is memory-type agnostic (it only emits rowop_* primitives) and,
+ * like 94_/96_, models op type/count/timing, not functional data.  A handful
+ * of Ambit control rows (B_T0..B_DCC1) are reused as generic scratch.
  * --------------------------------------------------------------------- */
-#define BANKS 32
- 
+#define NUM_BANKS 128   /* max banks in the CIMTRACE 128-bit bank-mask format */
+#define BANK_VEC_ALIGNMENT ((size_t)ROW_SIZE * NUM_BANKS)
+#define BANKS NUM_BANKS
+
 #define BANK_ROW(ptr, bank)  ((void *)((char *)(ptr) + (bank) * ROW_SIZE))
- 
+
 #define AAP_ONE_BANK(dst, src, bank) \
     rowop_aap(BANK_ROW((dst), (bank)), BANK_ROW((src), (bank)))
+#define AAAP_ONE_BANK(dst, s1, s2, bank) \
+    rowop_aaap(BANK_ROW((dst), (bank)), BANK_ROW((s1), (bank)), BANK_ROW((s2), (bank)))
 #define ANAP_ONE_BANK(dst, src, bank) \
     rowop_anap(BANK_ROW((dst), (bank)), BANK_ROW((src), (bank)))
-#define AAAP_ONE_BANK(dst, src1, src2, bank) \
-    rowop_aaap(BANK_ROW((dst), (bank)), BANK_ROW((src1), (bank)), BANK_ROW((src2), (bank)))
-#define AAAAAP_ONE_BANK(dst, src1, src2, src3, src4, bank) \
-    rowop_aaaaap(BANK_ROW((dst), (bank)), BANK_ROW((src1), (bank)), BANK_ROW((src2), (bank)), BANK_ROW((src3), (bank)), BANK_ROW((src4), (bank)))
+#define AAAAAP_ONE_BANK(dst, s1, s2, s3, s4, bank) \
+    rowop_aaaaap(BANK_ROW((dst), (bank)), BANK_ROW((s1), (bank)), BANK_ROW((s2), (bank)), \
+                 BANK_ROW((s3), (bank)), BANK_ROW((s4), (bank)))
 #define COPY_BANK_TO_BANK(dst, dst_bank, src, src_bank) \
     rowop_copy(BANK_ROW((dst), (dst_bank)), BANK_ROW((src), (src_bank)))
- 
+
 /* -----------------------------------------------------------------------
  * Verbosity level (set via -v / -vv command-line flag):
  *   0 = silent  (default, suitable for gem5 simulation)
@@ -44,140 +67,160 @@ typedef struct {
     int bitwidth;
 } RowCopyTask;
 
+/* -----------------------------------------------------------------------
+ * Row allocator (see 94_simdram_schedule_runner.c for the subarray-contiguity
+ * rationale; the budget is identical -- PRADA reuses the same shared pools and
+ * the 18 Ambit control rows as scratch).
+ * --------------------------------------------------------------------- */
 static unsigned *alloc_vec_all_banks(void) {
     unsigned *p = NULL;
-    if (posix_memalign((void **)&p, ALIGNMENT, ALIGNMENT)) {
+    if (posix_memalign((void **)&p, BANK_VEC_ALIGNMENT, BANK_VEC_ALIGNMENT)) {
         fprintf(stderr, "alloc_vec_all_banks: out of memory\n");
         exit(1);
     }
     return p;
 }
- 
+
 /* -----------------------------------------------------------------------
- * Bit-serial primitives used by execute_mul
+ * Bit-serial primitives (PRADA).
  * --------------------------------------------------------------------- */
+
+/* out = lhs AND rhs = MAJ(lhs, rhs, 0).  out is preset to 0 (from C_0), the
+ * operands are staged into scratch (they survive, being reused across the
+ * multiplier's partial products), then one TRA computes the majority.
+ * 4 row-ops per bit-row AND. */
+static inline void execute_row_and(
+    unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit,
+    const int *bank_ids, int bank_count)
+{
+    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK (out_bit, C_0,      bank_ids[i]); /* out = 0        */
+    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK (B_T0,    lhs_bit,  bank_ids[i]); /* T0  = lhs      */
+    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK (B_T1,    rhs_bit,  bank_ids[i]); /* T1  = rhs      */
+    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK(out_bit, B_T0, B_T1, bank_ids[i]); /* out = MAJ(0,lhs,rhs) */
+}
+
+/* Full adder, PRADA style (paper §5.2):
+ *   carry-out C = MAJ(a, b, cin)              -> 1 TRA  (ROWAAAP)
+ *   ~C                                         -> 1 NOT  (ROWANAP)
+ *   sum       S = MAJ(a, b, cin, ~C, ~C)       -> 1 5RA  (ROWAAAAAP)
+ * The sum needs a, b, cin again, so copies are preserved first:
+ *   out <- a ; T2 <- b ; {cout, T3} <- cin.
+ * The TRA runs in place on cout (= cin) so cout holds the carry-out; the NOT
+ * inverts the carry copy left in the lhs row (DCC0 = ~C), leaving cout = C.
+ * 6 row-ops per bit (2 AAP + 2 AAAP + 1 ANAP + 1 AAAAAP), vs SIMDRAM's 9. */
 static inline void execute_row_add(
     unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit,
-    unsigned *cin_bit, unsigned *cout_bit, unsigned **tmp,
+    unsigned *cin_bit, unsigned *cout_bit,
     const int *bank_ids, int bank_count)
 {
-    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK(tmp[1], lhs_bit, tmp[0], bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK(tmp[3], rhs_bit, tmp[2], bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK(out_bit, cin_bit, cout_bit, bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK(cout_bit, tmp[0], tmp[2], bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) ANAP_ONE_BANK(tmp[4], tmp[2], bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) AAAAAP_ONE_BANK(out_bit, tmp[2], tmp[4], tmp[1], tmp[3], bank_ids[i]);
+    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK   (out_bit,  lhs_bit,           bank_ids[i]); /* out = a               */
+    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK   (B_T2,     rhs_bit,           bank_ids[i]); /* T2  = b               */
+    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK  (cout_bit, cin_bit, B_T3,     bank_ids[i]); /* cout = cin, T3 = cin  */
+    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK  (cout_bit, lhs_bit, rhs_bit,  bank_ids[i]); /* cout = MAJ(cin,a,b)=C */
+    for (int i = 0; i < bank_count; i++) ANAP_ONE_BANK  (B_DCC0,   lhs_bit,           bank_ids[i]); /* DCC0 = ~C (lhs = C)   */
+    for (int i = 0; i < bank_count; i++) AAAAAP_ONE_BANK(out_bit,  B_T2, B_T3, B_DCC0, lhs_bit, bank_ids[i]); /* out = MAJ(a,b,cin,~C,~C) */
 }
- 
-static inline void execute_row_and(
-    unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit, unsigned **tmp,
-    const int *bank_ids, int bank_count)
-{
-    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK(tmp[0],  lhs_bit, bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK(tmp[1],  rhs_bit, bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK(out_bit, C_0,     bank_ids[i]);
-    for (int i = 0; i < bank_count; i++) AAAP_ONE_BANK(out_bit, tmp[0], tmp[1], bank_ids[i]);
-}
- 
+
 /* -----------------------------------------------------------------------
- * Core execute_add
+ * Core execute_add — ripple-carry adder (carry ripples in place through
+ * B_DCC1: cin == cout each bit).
  * --------------------------------------------------------------------- */
 void execute_add(
     int lhs_bw, int rhs_bw,
     const int *bank_ids, int bank_count,
-    unsigned **lhs, unsigned **rhs, unsigned **out, unsigned **tmp)
+    unsigned **lhs, unsigned **rhs, unsigned **out)
 {
     int bw = (lhs_bw < rhs_bw) ? lhs_bw : rhs_bw;
 
-    unsigned *carry = C_0;
+    /* initialise carry to 0 */
+    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK(B_DCC1, C_0, bank_ids[i]);
+
     for (int j = 0; j < bw; j++) {
         if (g_verbose >= 2)
             printf("      [bit=%d] full-adder: out[%d] = lhs[%d] + rhs[%d] + carry  ->  carry\n",
                    j, j, j, j);
-        execute_row_add(lhs[j], rhs[j], out[j], carry, carry, tmp, bank_ids, bank_count);
+        execute_row_add(lhs[j], rhs[j], out[j], B_DCC1, B_DCC1, bank_ids, bank_count);
     }
 }
 
 /* -----------------------------------------------------------------------
- * Core execute_mul
+ * Core execute_mul — shift-add multiplier (schedule identical to SIMDRAM;
+ * only execute_row_and / execute_row_add are the PRADA variants).
  * --------------------------------------------------------------------- */
 void execute_mul(
     int lhs_bw, int rhs_bw,
     const int *bank_ids, int bank_count,
     unsigned **lhs, unsigned **rhs, unsigned **out,
-    unsigned **partial, unsigned **tmp)
+    unsigned **partial, unsigned **tmp, unsigned **carry)
 {
-    unsigned *carry0 = tmp[5];
-    unsigned *carry1 = tmp[6];
-
     /* --- Phase 1: initialise out[0] and partial[] using rhs[0] --------- */
     if (g_verbose >= 2)
         printf("      [init]    AND  out[0] = lhs[0] & rhs[0]\n");
-    execute_row_and(lhs[0], rhs[0], out[0], tmp, bank_ids, bank_count);
+    execute_row_and(lhs[0], rhs[0], out[0], bank_ids, bank_count);
 
     for (int i = 0; i < lhs_bw - 1; i++) {
         if (g_verbose >= 2)
             printf("      [init]    AND  partial[%d] = lhs[%d] & rhs[0]\n", i, i + 1);
-        execute_row_and(lhs[i + 1], rhs[0], partial[i], tmp, bank_ids, bank_count);
+        execute_row_and(lhs[i + 1], rhs[0], partial[i], bank_ids, bank_count);
     }
 
-    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK(carry1, C_0, bank_ids[i]);
+    for (int i = 0; i < bank_count; i++) AAP_ONE_BANK(carry[1], C_0, bank_ids[i]);
 
     /* --- Phase 2: accumulate rhs[1..rhs_bw-2] -------------------------- */
     for (int i = 0; i < rhs_bw - 1; i++) {
         if (g_verbose >= 2)
             printf("      [rhs=%d]   AND  tmp = lhs[0] & rhs[%d]\n", i, i);
-        execute_row_and(lhs[0], rhs[i], tmp[0], tmp, bank_ids, bank_count);
+        execute_row_and(lhs[0], rhs[i], tmp[0], bank_ids, bank_count);
 
         if (g_verbose >= 2)
             printf("      [rhs=%d]   ADD  out[%d] = tmp + partial[0] + 0  ->carry[0]\n", i, i);
-        execute_row_add(tmp[0], partial[0], out[i], C_0, carry0, tmp, bank_ids, bank_count);
+        execute_row_add(tmp[0], partial[0], out[i], C_0, carry[0], bank_ids, bank_count);
 
         for (int j = 1; j < lhs_bw - 1; j++) {
             if (g_verbose >= 2)
                 printf("      [rhs=%d]   AND  tmp = lhs[%d] & rhs[%d]\n", i, j, i);
-            execute_row_and(lhs[j], rhs[i], tmp[0], tmp, bank_ids, bank_count);
+            execute_row_and(lhs[j], rhs[i], tmp[0], bank_ids, bank_count);
 
             if (g_verbose >= 2)
                 printf("      [rhs=%d]   ADD  partial[%d] = tmp + partial[%d] + carry[0]  ->carry[0]\n",
                        i, j - 1, j);
-            execute_row_add(tmp[0], partial[j], partial[j - 1], carry0, carry0, tmp, bank_ids, bank_count);
+            execute_row_add(tmp[0], partial[j], partial[j - 1], carry[0], carry[0], bank_ids, bank_count);
         }
 
         if (g_verbose >= 2)
             printf("      [rhs=%d]   AND  tmp = lhs[%d] & rhs[%d]\n", i, lhs_bw - 1, i);
-        execute_row_and(lhs[lhs_bw - 1], rhs[i], tmp[0], tmp, bank_ids, bank_count);
+        execute_row_and(lhs[lhs_bw - 1], rhs[i], tmp[0], bank_ids, bank_count);
 
         if (g_verbose >= 2)
             printf("      [rhs=%d]   ADD  partial[%d] = tmp + carry[0] + carry[1]  ->carry[1]\n",
                    i, lhs_bw - 2);
-        execute_row_add(tmp[0], carry0, partial[lhs_bw - 2], carry1, carry1, tmp, bank_ids, bank_count);
+        execute_row_add(tmp[0], carry[0], partial[lhs_bw - 2], carry[1], carry[1], bank_ids, bank_count);
     }
 
     /* --- Phase 3: final row rhs[rhs_bw-1] ------------------------------ */
     if (g_verbose >= 2)
         printf("      [final]   AND  tmp = lhs[0] & rhs[%d]\n", rhs_bw - 1);
-    execute_row_and(lhs[0], rhs[rhs_bw - 1], tmp[0], tmp, bank_ids, bank_count);
+    execute_row_and(lhs[0], rhs[rhs_bw - 1], tmp[0], bank_ids, bank_count);
 
     for (int i = 1; i < lhs_bw - 1; i++) {
         if (g_verbose >= 2)
             printf("      [final]   AND  tmp = lhs[%d] & rhs[%d]\n", i, rhs_bw - 1);
-        execute_row_and(lhs[i], rhs[rhs_bw - 1], tmp[0], tmp, bank_ids, bank_count);
+        execute_row_and(lhs[i], rhs[rhs_bw - 1], tmp[0], bank_ids, bank_count);
 
         if (g_verbose >= 2)
             printf("      [final]   ADD  out[%d] = tmp + partial[%d] + carry[0]  ->carry[0]\n",
                    rhs_bw - 1 + i, i - 1);
-        execute_row_add(tmp[0], partial[i - 1], out[rhs_bw - 1 + i], carry0, carry0, tmp, bank_ids, bank_count);
+        execute_row_add(tmp[0], partial[i - 1], out[rhs_bw - 1 + i], carry[0], carry[0], bank_ids, bank_count);
     }
 
     if (g_verbose >= 2)
         printf("      [final]   AND  tmp = lhs[%d] & rhs[%d]\n", lhs_bw - 1, rhs_bw - 1);
-    execute_row_and(lhs[lhs_bw - 1], rhs[rhs_bw - 1], tmp[0], tmp, bank_ids, bank_count);
+    execute_row_and(lhs[lhs_bw - 1], rhs[rhs_bw - 1], tmp[0], bank_ids, bank_count);
 
     if (g_verbose >= 2)
         printf("      [final]   ADD  out[%d] = tmp + carry[1] + carry[0]  ->out[%d]\n",
                lhs_bw + rhs_bw - 2, lhs_bw + rhs_bw - 1);
-    execute_row_add(tmp[0], carry1, out[lhs_bw + rhs_bw - 2], carry0, out[lhs_bw + rhs_bw - 1], tmp, bank_ids, bank_count);
+    execute_row_add(tmp[0], carry[1], out[lhs_bw + rhs_bw - 2], carry[0], out[lhs_bw + rhs_bw - 1], bank_ids, bank_count);
 }
 
 /* -----------------------------------------------------------------------
@@ -213,9 +256,10 @@ void execute_row_copy_batch(const RowCopyTask *tasks, int task_count) {
  * Schedule runner
  * ===================================================================== */
 
-#define SCHED_MAX_BANKS      32
+#define SCHED_MAX_BANKS      NUM_BANKS
+
+/* Compile-time upper bound only; actual allocations are schedule-derived. */
 #define SCHED_MAX_BW         64
-#define PRADA_TMP_ROWS       10
 
 typedef enum { OP_MULI = 0, OP_ADDI = 1, OP_ROW_COPY = 2 } OpType;
 
@@ -227,25 +271,31 @@ typedef struct {
     int64_t  last_end_time;
 } TraceHeader;
 
+/* 48-byte record: MULI/ADDI banks are a 128-bit mask (bit b => banks[b>>6]
+ * bit (b&63)); ROWCOPY uses src/dst (0..127). Must match the MLIR writer. */
 typedef struct {
     int64_t  start;
     int64_t  end;
-    uint32_t banks;
+    uint64_t banks[2];
     uint16_t lhs_bw;
     uint16_t rhs_bw;
     uint8_t  kind;
     uint8_t  src;
     uint8_t  dst;
-    uint8_t  pad[5];
+    uint8_t  pad[9];
 } TraceRecord;
 _Static_assert(sizeof(TraceHeader) == 32, "TraceHeader must be 32 bytes");
-_Static_assert(sizeof(TraceRecord) == 32, "TraceRecord must be 32 bytes");
+_Static_assert(sizeof(TraceRecord) == 48, "TraceRecord must be 48 bytes");
 
+/* -----------------------------------------------------------------------
+ * Shared row pools used by both add and mul.
+ * --------------------------------------------------------------------- */
 static unsigned *g_lhs    [SCHED_MAX_BW];
 static unsigned *g_rhs    [SCHED_MAX_BW];
 static unsigned *g_out    [2 * SCHED_MAX_BW];
 static unsigned *g_partial[SCHED_MAX_BW];
-static unsigned *g_tmp    [PRADA_TMP_ROWS];
+static unsigned *g_tmp    [1];
+static unsigned *g_carry  [2];
 
 typedef struct {
     int max_lhs_bw;
@@ -261,24 +311,34 @@ static void init_pool_widths(PoolWidths *pw) {
 static int check_row_budget(const PoolWidths *pw) {
     int pool_rows =
         pw->max_lhs_bw + pw->max_rhs_bw + pw->max_out_bw + pw->max_partial_bw +
-        PRADA_TMP_ROWS + 1; /* tmp rows + C_0 */
-    if (pool_rows > ROWS_PER_SUBARRAY) {
+        1 + 2; /* tmp + carry */
+    int total_rows = 18 + pool_rows; /* 18 ambit control rows */
+    if (total_rows > ROWS_PER_SUBARRAY) {
         fprintf(stderr,
-                "schedule_runner: row budget overflow: need %d rows, but ROWS_PER_SUBARRAY=%d\n",
-                pool_rows, ROWS_PER_SUBARRAY);
+                "schedule_runner: row budget overflow: need %d rows (including 18 control rows), "
+                "but ROWS_PER_SUBARRAY=%d\n",
+                total_rows, ROWS_PER_SUBARRAY);
         return -1;
     }
     return 0;
 }
 
 static void alloc_row_pools(const PoolWidths *pw) {
-    C_0 = alloc_vec_all_banks();
-
-    for (int j = 0; j < pw->max_lhs_bw; j++) g_lhs[j] = alloc_vec_all_banks();
-    for (int j = 0; j < pw->max_rhs_bw; j++) g_rhs[j] = alloc_vec_all_banks();
-    for (int j = 0; j < pw->max_out_bw; j++) g_out[j] = alloc_vec_all_banks();
-    for (int j = 0; j < pw->max_partial_bw; j++) g_partial[j] = alloc_vec_all_banks();
-    for (int j = 0; j < PRADA_TMP_ROWS; j++) g_tmp[j] = alloc_vec_all_banks();
+    for (int j = 0; j < pw->max_lhs_bw; j++) {
+        g_lhs[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_rhs_bw; j++) {
+        g_rhs[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_out_bw; j++) {
+        g_out[j]                = alloc_vec_all_banks();
+    }
+    for (int j = 0; j < pw->max_partial_bw; j++) {
+        g_partial[j]            = alloc_vec_all_banks();
+    }
+    g_tmp[0]   = alloc_vec_all_banks();
+    g_carry[0] = alloc_vec_all_banks();
+    g_carry[1] = alloc_vec_all_banks();
 }
 
 /* -----------------------------------------------------------------------
@@ -300,10 +360,10 @@ static int read_trace_header(FILE *f, TraceHeader *hdr) {
     return 0;
 }
 
-static int bank_mask_to_ids(uint32_t mask, int *bank_ids) {
+static int bank_mask_to_ids(const uint64_t mask[2], int *bank_ids) {
     int n = 0;
     for (int b = 0; b < SCHED_MAX_BANKS; b++) {
-        if (mask & (1u << b)) bank_ids[n++] = b;
+        if (mask[b >> 6] & (1ull << (b & 63))) bank_ids[n++] = b;
     }
     return n;
 }
@@ -325,16 +385,16 @@ static void execute_trace_record(const TraceRecord *rec) {
             execute_mul((int)rec->lhs_bw, (int)rec->rhs_bw,
                         bank_ids, bank_count,
                         g_lhs, g_rhs, g_out,
-                        g_partial, g_tmp);
+                        g_partial, g_tmp, g_carry);
         } else {
             execute_add((int)rec->lhs_bw, (int)rec->rhs_bw,
                         bank_ids, bank_count,
-                        g_lhs, g_rhs, g_out, g_tmp);
+                        g_lhs, g_rhs, g_out);
         }
     } else {
         RowCopyTask task;
-        task.src      = g_out;
-        task.dst      = g_lhs;
+        task.src = g_out;
+        task.dst = g_lhs;
         task.src_bank = rec->src;
         task.dst_bank = rec->dst;
         task.bitwidth = rec->lhs_bw;
@@ -394,8 +454,7 @@ static int derive_pool_widths_from_trace(const char *path, PoolWidths *pw, Trace
 
     if (pw->max_lhs_bw > SCHED_MAX_BW || pw->max_rhs_bw > SCHED_MAX_BW ||
         pw->max_partial_bw > SCHED_MAX_BW || pw->max_out_bw > 2 * SCHED_MAX_BW) {
-        fprintf(stderr, "schedule_runner: schedule bitwidth exceeds SCHED_MAX_BW=%d\n",
-                SCHED_MAX_BW);
+        fprintf(stderr, "schedule_runner: schedule bitwidth exceeds SCHED_MAX_BW=%d\n", SCHED_MAX_BW);
         fclose(f);
         return -1;
     }
@@ -446,6 +505,9 @@ static int execute_trace_once(const char *path) {
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * main
+ * --------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <schedule.bin> [-v|-vv]\n", argv[0]);
@@ -462,24 +524,16 @@ int main(int argc, char *argv[]) {
     if (derive_pool_widths_from_trace(argv[1], &widths, &hdr) != 0) return 1;
     if (check_row_budget(&widths) != 0) return 1;
 
+    /* init_ambit() first (18 control rows, reused as PRADA scratch), then data
+     * rows -- all via sequential posix_memalign so they stay physically
+     * contiguous within a single DRAM subarray. */
+    init_ambit();
     alloc_row_pools(&widths);
 
     if (g_verbose >= 1) {
         printf("Loaded trace '%s': records=%llu, last_end_time=%lld\n\n",
                argv[1], (unsigned long long)hdr.num_records, (long long)hdr.last_end_time);
     }
-
-    // for (int iter = 0; iter < 2; iter++) {
-    //     m5_reset_stats(0, 0);
-
-    //     if (g_verbose >= 1)
-    //         printf("=== %s (iter %d) ===\n",
-    //                iter == 0 ? "Warmup     " : "Measurement", iter);
-
-    //     if (execute_trace_once(argv[1]) != 0) return 1;
-
-    //     if (g_verbose >= 1) printf("\n");
-    // }
 
     m5_reset_stats(0, 0);
 

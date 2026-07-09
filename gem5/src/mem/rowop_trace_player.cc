@@ -97,8 +97,9 @@ RowOpTracePlayer::parseBackend(const std::string& name)
 {
     if (name == "simdram") return BK_SIMDRAM;
     if (name == "fcdram")  return BK_FCDRAM;
-    fatal("RowOpTracePlayer: unknown backend '%s' (expected 'simdram' or "
-          "'fcdram')", name.c_str());
+    if (name == "prada")   return BK_PRADA;
+    fatal("RowOpTracePlayer: unknown backend '%s' (expected 'simdram', "
+          "'fcdram' or 'prada')", name.c_str());
     return BK_SIMDRAM; // unreachable; silences -Wreturn-type
 }
 
@@ -300,6 +301,7 @@ RowOpTracePlayer::expandAdd(int lhs_bw, int rhs_bw,
     switch (backend) {
       case BK_SIMDRAM: expandAddSimdram(lhs_bw, rhs_bw, banks); break;
       case BK_FCDRAM:  expandAddFcdram (lhs_bw, rhs_bw, banks); break;
+      case BK_PRADA:   expandAddPrada  (lhs_bw, rhs_bw, banks); break;
     }
 }
 
@@ -310,6 +312,7 @@ RowOpTracePlayer::expandMul(int lhs_bw, int rhs_bw,
     switch (backend) {
       case BK_SIMDRAM: expandMulSimdram(lhs_bw, rhs_bw, banks); break;
       case BK_FCDRAM:  expandMulFcdram (lhs_bw, rhs_bw, banks); break;
+      case BK_PRADA:   expandMulPrada  (lhs_bw, rhs_bw, banks); break;
     }
 }
 
@@ -616,6 +619,156 @@ RowOpTracePlayer::expandMulFcdram(int lhs_bw, int rhs_bw,
                  carryBase + 0, outBase + lhs_bw + rhs_bw - 1, banks);
 }
 
+// ===========================================================================
+// PRADA backend (PRADA, ICCAD'24: "A Processing-using-Memory Architecture for
+// Commodity DRAM Devices with Enhanced Compatibility and Reliability").
+//
+// Mirrors 95_prada_schedule_runner.c.  ADDI/MULI keep the exact same bit-serial
+// shift-add schedule as the SIMDRAM backend; only the bit-row AND and the
+// full-adder change.  PRADA's distinctive mechanism (Sequential Row Activation)
+// lets it build them from three row-ops instead of Ambit's AAP chains:
+//
+//   * TRA  (Triple Row Activation, A A As P): a 3-row charge-sharing majority
+//     R = MAJ(a,b,c); with c preset to 0 this is a AND b (paper §2.2/§4.2).
+//     Timing = ROWAAAP (aaapBank: tRAS + 2*tWLOV).  The same 3-activation
+//     sequence also serves as a two-destination copy (As A A P), which the
+//     paper uses to stage operands -- identical timing.
+//   * N    (single-command NOT, As N A P): PRADA inverts on the sense amp with
+//     no DCC and writes the result to a second row (paper §4.1/§5).  Timing =
+//     ROWANAP (anapBank: tRCD + tNOT + tRAS).
+//   * 5RA  (Five Row Activation, A A A A As P): a 5-row majority used for the
+//     sum, S = MAJ(a,b,cin,~C,~C) (paper §5.2).  Timing = ROWAAAAAP
+//     (aaaaapBank: tRAS + 4*tWLOV).
+//
+// No new gem5 primitive is required: ROWAAAP / ROWANAP / ROWAAAAAP already
+// exist with these timings.  Like the other backends this models op
+// type/count/timing only, not functional data.  A handful of control-row slots
+// (SLOT_T0..SLOT_DCC1) are reused as generic per-bank scratch; PRADA does not
+// use the Ambit magic-row (T0_T1_T2, ...) semantics.
+// ===========================================================================
+
+// ROWAAAP: 3-activation sequence (TRA majority or two-destination copy).
+void RowOpTracePlayer::emitAAAP(int dst_slot, int src1_slot, int src2_slot,
+                                 int bank)
+{
+    pendingOps.push_back({Request::ROWAAAP,
+                          dst_slot, bank, src1_slot, bank, src2_slot, bank});
+}
+
+// ROWANAP: sense src, invert (single-command NOT), copy to dst.
+void RowOpTracePlayer::emitANAP(int dst_slot, int src_slot, int bank)
+{
+    pendingOps.push_back({Request::ROWANAP,
+                          dst_slot, bank, src_slot, bank, 0, bank});
+}
+
+// ROWAAAAAP: 5-activation 5-row majority (5RA).  Timing is fixed at 5
+// activations regardless of how many rows are named, so packing dst + 2 src
+// addresses is sufficient for the timing model.
+void RowOpTracePlayer::emitAAAAAP(int dst_slot, int src1_slot, int src2_slot,
+                                   int bank)
+{
+    pendingOps.push_back({Request::ROWAAAAAP,
+                          dst_slot, bank, src1_slot, bank, src2_slot, bank});
+}
+
+// execute_row_and:  out = lhs AND rhs = MAJ(lhs, rhs, 0)  (TRA with c = 0).
+// out is preset to 0 (from the C_0 constant row) so the TRA reads {0, lhs, rhs};
+// lhs/rhs are staged into scratch so the operands survive (they are reused
+// across the multiplier's partial products).  4 row-ops per bit-row AND.
+void
+RowOpTracePlayer::emitRowAndPrada(int lhs_slot, int rhs_slot, int out_slot,
+                                   const std::vector<int>& banks)
+{
+    for (int b : banks) emitAAP (out_slot, SLOT_C_0,  b);  // out = 0
+    for (int b : banks) emitAAP (SLOT_T0,  lhs_slot,  b);  // T0  = lhs
+    for (int b : banks) emitAAP (SLOT_T1,  rhs_slot,  b);  // T1  = rhs
+    for (int b : banks) emitAAAP(out_slot, SLOT_T0, SLOT_T1, b); // out = MAJ(0,lhs,rhs)
+}
+
+// execute_row_add:  bit-serial full adder, PRADA style (paper §5.2).
+//   carry-out C = MAJ(a, b, cin)                 -> 1 TRA  (ROWAAAP)
+//   ~C                                            -> 1 NOT  (ROWANAP)
+//   sum       S = MAJ(a, b, cin, ~C, ~C)          -> 1 5RA  (ROWAAAAAP)
+// Staging (a, b consumed by the TRA are single-use here, but the sum needs
+// a, b, cin again, so fresh copies are preserved first):
+//   out <- a ; T2 <- b ; {cout, T3} <- cin  (cin duplicated for TRA and 5RA).
+// The TRA runs in place on cout (= cin) so cout holds the carry-out; the NOT
+// inverts the carry copy left in the lhs row, leaving cout = C intact.  Total
+// 6 row-ops per bit vs SIMDRAM's 9 -- 2 AAP + 2 AAAP + 1 ANAP + 1 AAAAAP.
+void
+RowOpTracePlayer::emitRowAddPrada(int lhs_slot, int rhs_slot, int out_slot,
+                                   int cin_slot, int cout_slot,
+                                   const std::vector<int>& banks)
+{
+    for (int b : banks) emitAAP  (out_slot,  lhs_slot, b);            // out = a
+    for (int b : banks) emitAAP  (SLOT_T2,   rhs_slot, b);            // T2  = b
+    for (int b : banks) emitAAAP (cout_slot, cin_slot, SLOT_T3, b);   // cout=cin, T3=cin
+    for (int b : banks) emitAAAP (cout_slot, lhs_slot, rhs_slot, b);  // cout = MAJ(cin,a,b) = C
+    for (int b : banks) emitANAP (SLOT_DCC0, lhs_slot, b);            // DCC0 = ~C (lhs holds C)
+    for (int b : banks) emitAAAAAP(out_slot, SLOT_T2, SLOT_T3, b);    // out = MAJ(a,b,cin,~C,~C)
+}
+
+// PRADA execute_add — ripple-carry adder (one full adder per bit); the carry
+// ripples in place through SLOT_DCC1 (cin == cout each bit).
+void
+RowOpTracePlayer::expandAddPrada(int lhs_bw, int rhs_bw,
+                                  const std::vector<int>& banks)
+{
+    int bw = std::min(lhs_bw, rhs_bw);
+
+    for (int b : banks) emitAAP(SLOT_DCC1, SLOT_C_0, b);   // carry := 0
+
+    for (int j = 0; j < bw; j++)
+        emitRowAddPrada(lhsBase + j, rhsBase + j, outBase + j,
+                        SLOT_DCC1, SLOT_DCC1, banks);
+}
+
+// PRADA execute_mul — shift-add multiplier (schedule identical to SIMDRAM;
+// only emitRowAnd/emitRowAdd are the PRADA variants).
+void
+RowOpTracePlayer::expandMulPrada(int lhs_bw, int rhs_bw,
+                                  const std::vector<int>& banks)
+{
+    // Phase 1: init out[0] and partial[] from rhs[0]
+    emitRowAndPrada(lhsBase + 0, rhsBase + 0, outBase + 0, banks);
+
+    for (int i = 0; i < lhs_bw - 1; i++)
+        emitRowAndPrada(lhsBase + i + 1, rhsBase + 0, partialBase + i, banks);
+
+    for (int b : banks) emitAAP(carryBase + 1, SLOT_C_0, b);   // carry[1] := 0
+
+    // Phase 2: accumulate rhs[1..rhs_bw-2]
+    for (int i = 0; i < rhs_bw - 1; i++) {
+        emitRowAndPrada(lhsBase + 0, rhsBase + i, tmpBase + 0, banks);
+        emitRowAddPrada(tmpBase + 0, partialBase + 0, outBase + i,
+                        SLOT_C_0,    carryBase + 0,   banks);
+
+        for (int j = 1; j < lhs_bw - 1; j++) {
+            emitRowAndPrada(lhsBase + j, rhsBase + i, tmpBase + 0, banks);
+            emitRowAddPrada(tmpBase + 0, partialBase + j, partialBase + j - 1,
+                            carryBase + 0, carryBase + 0, banks);
+        }
+
+        emitRowAndPrada(lhsBase + lhs_bw - 1, rhsBase + i, tmpBase + 0, banks);
+        emitRowAddPrada(tmpBase + 0, carryBase + 0, partialBase + lhs_bw - 2,
+                        carryBase + 1, carryBase + 1, banks);
+    }
+
+    // Phase 3: final row rhs[rhs_bw-1]
+    emitRowAndPrada(lhsBase + 0, rhsBase + rhs_bw - 1, tmpBase + 0, banks);
+
+    for (int i = 1; i < lhs_bw - 1; i++) {
+        emitRowAndPrada(lhsBase + i, rhsBase + rhs_bw - 1, tmpBase + 0, banks);
+        emitRowAddPrada(tmpBase + 0, partialBase + i - 1, outBase + rhs_bw - 1 + i,
+                        carryBase + 0, carryBase + 0, banks);
+    }
+
+    emitRowAndPrada(lhsBase + lhs_bw - 1, rhsBase + rhs_bw - 1, tmpBase + 0, banks);
+    emitRowAddPrada(tmpBase + 0, carryBase + 1, outBase + lhs_bw + rhs_bw - 2,
+                    carryBase + 0, outBase + lhs_bw + rhs_bw - 1, banks);
+}
+
 // ---------------------------------------------------------------------------
 // execute_row_copy_batch (single task: src_bank -> dst_bank for bw slots)
 //
@@ -740,10 +893,13 @@ RowOpTracePlayer::loadTrace()
     carryBase   = tmpBase     + 1;
     int totalSlots = carryBase + 2;
 
+    const char* backendName = backend == BK_FCDRAM ? "fcdram"
+                            : backend == BK_PRADA  ? "prada"
+                            : "simdram";
     inform("RowOpTracePlayer: %llu records, format=%d-bank, backend=%s, "
            "slots=%d (rows/bank)",
            (unsigned long long)hdr.num_records, total_banks,
-           backend == BK_FCDRAM ? "fcdram" : "simdram", totalSlots);
+           backendName, totalSlots);
 
     if (totalSlots >= ROWS_PER_SUBARRAY)
         panic("RowOpTracePlayer: %d slots exceed rows_per_subarray (%d)",
