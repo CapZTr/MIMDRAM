@@ -462,10 +462,17 @@ AbstractMemory::access(PacketPtr pkt)
                     *dest++ = ~0ULL;
                 break;
             case Request::MAJ3:
-                // In-place 3-input majority: dest = MAJ(dest, src1, src2)
+                // 3-input majority via simultaneous multi-row activation
+                // (FracDRAM/PULSAR style).  Charge restoration writes the
+                // amplified majority value back into ALL activated rows, so
+                // src1/src2 are destroyed too — schedules must stage operands
+                // that need to survive into scratch copies first.
                 for (int i = 0; i < ROW_SIZE; i += sizeof(uint64_t)) {
-                    uint64_t a = *dest, b = *src1++, c = *src2++;
-                    *dest++ = (a & b) | (a & c) | (b & c);
+                    uint64_t a = *dest, b = *src1, c = *src2;
+                    uint64_t m = (a & b) | (a & c) | (b & c);
+                    *dest++ = m;
+                    *src1++ = m;
+                    *src2++ = m;
                 }
                 break;
             default:

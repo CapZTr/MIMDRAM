@@ -111,6 +111,7 @@ RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
       rowStride(p->row_stride),
       backend(parseBackend(p->backend)),
       bankParallel(p->bank_parallel),
+      slotOffset(parseBackend(p->backend) == BK_FCDRAM ? ROWS_PER_SUBARRAY : 0),
       masterID(p->system->getMasterId(name())),
       curGroup(0), issueIdx(0), completedCount(0),
       retryPkt(nullptr),
@@ -180,9 +181,15 @@ RowOpTracePlayer::slotAddr(int slot, int global_bank) const
 {
     int channel    = global_bank / banksPerChannel;
     int local_bank = global_bank % banksPerChannel;
+    // slotOffset shifts all compute/data rows into the middle subarray for
+    // the FCDRAM backend, so reference slots at slot ± ROWS_PER_SUBARRAY
+    // land in the two neighbouring subarrays (raw slot may be negative for
+    // the lower neighbour; the sum is always >= 0).
+    int row = slot + slotOffset;
+    assert(row >= 0);
     return baseAddr
          + (Addr)channel * channelSize
-         + ((Addr)slot * banksPerChannel + local_bank) * rowStride;
+         + ((Addr)row * banksPerChannel + local_bank) * rowStride;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,31 +377,44 @@ RowOpTracePlayer::expandMulSimdram(int lhs_bw, int rhs_bw,
 }
 
 // ===========================================================================
-// FCDRAM backend (COTS DDR4 functionally-complete gates)
+// FCDRAM backend (COTS DDR4 functionally-complete gates + FracDRAM MAJ)
 //
 // Mirrors 96_fcdram_schedule_runner.c.  ADDI/MULI keep the exact same
 // bit-serial shift-add schedule as the SIMDRAM backend; only the bit-row AND
 // and full-adder primitives change, now built from ROWCLONE (intra-subarray
-// copy), AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates) and MAJ3 (native
-// COTS intra-subarray 3-input majority).  The full adder uses MAJ3 for both
-// carry and sum instead of reconstructing them from {AND,OR,NOT}.
+// copy), AND_XSUB / OR_XSUB / NOT_XSUB (cross-subarray gates, FCDRAM
+// HPCA'24), MAJ3 (intra-subarray simultaneous multi-row majority,
+// FracDRAM/PULSAR) and FRAC (VDD/2 initialisation, FracDRAM).
 //
-// Cross-subarray gates require the compute (com/dst) row and its reference to
-// live in neighbouring subarrays of the same bank.  slotAddr() maps slot->row
-// linearly, so a slot's neighbouring-subarray mirror is slot + ROWS_PER_SUBARRAY
-// (same within-subarray offset => the APA activates exactly one row per
-// subarray, N=1, matching one bit-plane per bit-serial op).  This reproduces
-// the A-in-subarray-S / B-in-subarray-S+1 operand layout of the COTS
-// microworkloads (MIMDRAM_ext/microworkloads/{00_addition,31_and}_cots.c).
+// The cost model follows the mechanisms as characterised on real chips:
 //
-// Like the Ambit backend, this player models op *type/count/timing* only, not
-// functional results (the abstract-memory AAP/AP handlers are likewise no-ops).
-// The *_XSUB emitters therefore read the reference from the com row's own
-// mirror; the logical second operand named in the comments/parameters documents
-// intent and is not separately addressed.
+//  * Operand layout (paper §6.1): both data operands of an AND/OR live in
+//    the COMPUTE subarray as a simultaneously-activated row pair; the
+//    neighbouring REFERENCE subarray holds only constants (threshold row +
+//    VDD/2 row).  Compute/data rows sit in the MIDDLE of 3 subarrays
+//    (slotOffset), reference rows at slot ± ROWS_PER_SUBARRAY.
+//  * Half-row coverage (paper §5 footnote 6): open-bitline neighbours share
+//    only half of a row's sense amps, so covering a full bit-plane takes one
+//    APA towards EACH neighbour — every cross-subarray gate emits 2 packets.
+//  * Reference re-initialisation (paper §6.1.3): each AND/OR overwrites its
+//    reference pair with the NAND/NOR byproduct, so before every gate the
+//    threshold row is re-cloned from a per-subarray constant source
+//    (C_1/C_0 mirror) and the VDD/2 row is re-FRAC'd, per side.
+//  * Destructive MAJ (FracDRAM): restoration writes the majority value into
+//    ALL simultaneously-activated rows and the activation group includes a
+//    VDD/2 helper row.  Operands that must survive are staged into scratch
+//    copies and the helper (SLOT_DCC1N) is re-FRAC'd before every MAJ3.
+//
+// Like the Ambit backend, this player models op *type/count/timing* only,
+// not functional results.  Addressing remains a fiction in one respect: an
+// XSUB packet names the com row and ONE mirror row, standing for the whole
+// N:N activation group of that side (timing is one APA either way).  Not
+// modelled (declared idealisations): per-chip N:N activation-pair coverage
+// (paper Fig.5) and primitive success rates (paper Obs.3-19).
 // ===========================================================================
 
-// ROWCLONE: dst <- src, intra-subarray copy (both slots in subarray 0).
+// ROWCLONE: dst <- src, intra-subarray copy (same subarray after slotOffset;
+// reference-side re-init clones pass matching ± RPS offsets on both slots).
 void
 RowOpTracePlayer::emitClone(int dst_slot, int src_slot,
                              const std::vector<int>& banks)
@@ -404,39 +424,62 @@ RowOpTracePlayer::emitClone(int dst_slot, int src_slot,
                               dst_slot, b, src_slot, b, 0, b});
 }
 
-// AND_XSUB: com = com AND ref, ref at com's neighbouring-subarray mirror.
+// FRAC: drive dst to VDD/2 via interrupted activations (FracDRAM).
+void
+RowOpTracePlayer::emitFrac(int dst_slot, const std::vector<int>& banks)
+{
+    for (int b : banks)
+        pendingOps.push_back({Request::FRAC,
+                              dst_slot, b, dst_slot, b, 0, b});
+}
+
+// AND_XSUB: {com_slot, SLOT_T1} hold the operand pair in the compute
+// subarray; per neighbour side re-initialise the reference pair (VDD
+// threshold row from the C_1 mirror + FRAC the VDD/2 row) then issue the
+// APA.  Result lands in the compute pair (com_slot = AND, T1 clobbered).
 void
 RowOpTracePlayer::emitAndXsub(int com_slot, const std::vector<int>& banks)
 {
-    for (int b : banks)
-        pendingOps.push_back({Request::AND_XSUB,
-                              com_slot, b,
-                              com_slot + ROWS_PER_SUBARRAY, b, 0, b});
+    for (int side : {+ROWS_PER_SUBARRAY, -ROWS_PER_SUBARRAY}) {
+        emitClone(com_slot + side, SLOT_C_1 + side, banks); // VDD threshold
+        emitFrac (SLOT_T1  + side,                  banks); // VDD/2 row
+        for (int b : banks)
+            pendingOps.push_back({Request::AND_XSUB,
+                                  com_slot, b,
+                                  com_slot + side, b, 0, b});
+    }
 }
 
-// OR_XSUB: com = com OR ref, ref at com's neighbouring-subarray mirror.
+// OR_XSUB: same as AND but the threshold row is restored to GND (C_0 mirror).
 void
 RowOpTracePlayer::emitOrXsub(int com_slot, const std::vector<int>& banks)
 {
-    for (int b : banks)
-        pendingOps.push_back({Request::OR_XSUB,
-                              com_slot, b,
-                              com_slot + ROWS_PER_SUBARRAY, b, 0, b});
+    for (int side : {+ROWS_PER_SUBARRAY, -ROWS_PER_SUBARRAY}) {
+        emitClone(com_slot + side, SLOT_C_0 + side, banks); // GND threshold
+        emitFrac (SLOT_T1  + side,                  banks); // VDD/2 row
+        for (int b : banks)
+            pendingOps.push_back({Request::OR_XSUB,
+                                  com_slot, b,
+                                  com_slot + side, b, 0, b});
+    }
 }
 
-// NOT_XSUB: dst = ~src, src at dst's neighbouring-subarray mirror.
+// NOT_XSUB: dst = ~src through the shared sense-amp NOT gate; no reference
+// constants needed, but half-row coverage still takes one APA per side.
 void
 RowOpTracePlayer::emitNotXsub(int dst_slot, const std::vector<int>& banks)
 {
-    for (int b : banks)
-        pendingOps.push_back({Request::NOT_XSUB,
-                              dst_slot, b,
-                              dst_slot + ROWS_PER_SUBARRAY, b, 0, b});
+    for (int side : {+ROWS_PER_SUBARRAY, -ROWS_PER_SUBARRAY})
+        for (int b : banks)
+            pendingOps.push_back({Request::NOT_XSUB,
+                                  dst_slot, b,
+                                  dst_slot + side, b, 0, b});
 }
 
-// MAJ3: com = MAJ(com, s1, s2), intra-subarray triple-row activation.  All
-// three operands live in subarray 0 (no mirror), so dram_ctrl accepts it as an
-// intra-subarray op; timing reuses the charge-sharing MAJ latency (majBank).
+// MAJ3: com = MAJ(com, s1, s2), intra-subarray simultaneous multi-row
+// activation (FracDRAM/PULSAR); timing reuses the charge-sharing MAJ latency
+// (maj3Bank).  Callers FRAC the VDD/2 helper row (SLOT_DCC1N) first and must
+// treat s1/s2 as destroyed afterwards (see abstract_mem MAJ3).
 void
 RowOpTracePlayer::emitMaj3(int com_slot, int s1_slot, int s2_slot,
                             const std::vector<int>& banks)
@@ -446,45 +489,60 @@ RowOpTracePlayer::emitMaj3(int com_slot, int s1_slot, int s2_slot,
                               com_slot, b, s1_slot, b, s2_slot, b});
 }
 
-// execute_row_and:  out = lhs AND rhs   (ROWCLONE then AND_XSUB)
+// execute_row_and:  out = lhs AND rhs
+// Both operands are cloned into the compute-subarray activation pair
+// {out, T1}; emitAndXsub then re-inits the reference pair and fires one APA
+// per neighbour side.  8 packets per bit-row AND.
 void
 RowOpTracePlayer::emitRowAndFc(int lhs_slot, int rhs_slot, int out_slot,
                                 const std::vector<int>& banks)
 {
-    (void)rhs_slot; // reference operand; addressed via the com-row mirror
-    emitClone  (out_slot, lhs_slot, banks);  // out = lhs
-    emitAndXsub(out_slot,           banks);  // out = out AND rhs
+    emitClone  (out_slot, lhs_slot, banks);  // compute pair row 0 = lhs
+    emitClone  (SLOT_T1,  rhs_slot, banks);  // compute pair row 1 = rhs
+    emitAndXsub(out_slot,           banks);  // out = lhs AND rhs
 }
 
-// execute_row_add:  MAJ-based full adder using the native COTS 3-input MAJ.
+// execute_row_add:  MAJ-based full adder using the COTS 3-input MAJ.
 //   cout = MAJ(a, b, cin)
 //   sum  = MAJ(~cout, cin, MAJ(a, b, ~cout))   ; a ^ b ^ cin
-// 8 row-ops (4 CLONE + 1 NOT + 3 MAJ3) vs. 16 for the {AND,OR,NOT} expansion.
-// Staging rows: B_T3=cout, B_T2=~cout, B_T0=inner=MAJ(a,b,~cout).  This is a
-// timing model, so NOT_XSUB reads its neighbouring-subarray mirror (the
-// logical operand ~cout in B_T3 documents intent); MAJ3 operands are addressed
-// intra-subarray for the same-subarray/count assertions in dram_ctrl.
+// MAJ is destructive (restoration writes the majority into all activated
+// rows), so every MAJ3 operates on scratch copies of the operands that must
+// survive (b, cin, ~cout), and the VDD/2 helper row (B_DCC1N) is re-FRAC'd
+// before every MAJ3.  17 packets per full adder:
+//   9 CLONE + 3 FRAC + 3 MAJ3 + 1 NOT (2 packets, one per neighbour side).
+// Staging rows: B_T3=cout, B_T2=~cout, B_T0=inner, B_T1/B_DCC0=MAJ scratch.
+// Aliasing cout==cin stays safe: cin is only read (via copies) before the
+// final carry commit.
 void
 RowOpTracePlayer::emitRowAddFc(int lhs_slot, int rhs_slot, int out_slot,
                                 int cin_slot, int cout_slot,
                                 const std::vector<int>& banks)
 {
-    // cout = MAJ(a, b, cin) -> B_T3
-    emitClone(SLOT_T3, lhs_slot, banks);                 // B_T3 = a
-    emitMaj3 (SLOT_T3, rhs_slot, cin_slot, banks);        // B_T3 = MAJ(a,b,cin)=cout
+    // cout = MAJ(a, b, cin) -> B_T3   (b, cin staged; copies die in the MAJ)
+    emitClone(SLOT_T3,   lhs_slot, banks);               // B_T3   = a
+    emitClone(SLOT_T1,   rhs_slot, banks);               // B_T1   = b
+    emitClone(SLOT_DCC0, cin_slot, banks);               // B_DCC0 = cin
+    emitFrac (SLOT_DCC1N,          banks);               // VDD/2 helper
+    emitMaj3 (SLOT_T3, SLOT_T1, SLOT_DCC0, banks);       // B_T3 = cout
 
-    // ~cout -> B_T2
-    emitNotXsub(SLOT_T2, banks);                          // B_T2 = ~cout
+    // ~cout -> B_T2  (cross-subarray NOT, one APA per neighbour side)
+    emitNotXsub(SLOT_T2, banks);                         // B_T2 = ~cout
 
-    // inner = MAJ(a, b, ~cout) -> B_T0
-    emitClone(SLOT_T0, lhs_slot, banks);                 // B_T0 = a
-    emitMaj3 (SLOT_T0, rhs_slot, SLOT_T2, banks);         // B_T0 = MAJ(a,b,~cout)
+    // inner = MAJ(a, b, ~cout) -> B_T0  (~cout staged so B_T2 survives)
+    emitClone(SLOT_T0,   lhs_slot, banks);               // B_T0   = a
+    emitClone(SLOT_T1,   rhs_slot, banks);               // B_T1   = b (fresh)
+    emitClone(SLOT_DCC0, SLOT_T2,  banks);               // B_DCC0 = ~cout
+    emitFrac (SLOT_DCC1N,          banks);
+    emitMaj3 (SLOT_T0, SLOT_T1, SLOT_DCC0, banks);       // B_T0 = inner
 
-    // sum = MAJ(~cout, cin, inner) -> out
-    emitClone(out_slot, SLOT_T2, banks);                 // out = ~cout
-    emitMaj3 (out_slot, cin_slot, SLOT_T0, banks);        // out = a^b^cin = sum
+    // sum = MAJ(~cout, cin, inner) -> out  (cin staged: may be the C_0
+    // constant row or a live carry row, which the MAJ would destroy)
+    emitClone(out_slot, SLOT_T2,  banks);                // out  = ~cout
+    emitClone(SLOT_T1,  cin_slot, banks);                // B_T1 = cin
+    emitFrac (SLOT_DCC1N,         banks);
+    emitMaj3 (out_slot, SLOT_T1, SLOT_T0, banks);        // out = sum
 
-    // commit carry last (aliasing cout==cin is safe: cin read before this)
+    // commit carry last
     emitClone(cout_slot, SLOT_T3, banks);                // cout = carry-out
 }
 

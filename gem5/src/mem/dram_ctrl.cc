@@ -1558,6 +1558,10 @@ DRAMCtrl::andXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
 {
     // AND cross-subarray: APA(ref, com) → result in com rows
     // Reference subarray pre-initialised with VDD (for AND threshold)
+    // FCDRAM §6.2/Fig.13-14: the AND/OR APA violates BOTH tRAS and tRP
+    // (<3ns each) so charge-sharing happens before the ref cells restore;
+    // only the final restore phase waits the full tRAS.  (NOT differs: its
+    // first ACT must fully restore src, see notXsubBank.)
     DPRINTF(DRAM, "AND_XSUB rank %d bank %d ref_sub %d com_sub %d at tick %d\n",
             rank_ref.rank, bank_ref.bank,
             row_ref / rowsPerSubarray, row_com / rowsPerSubarray, act_tick);
@@ -1567,7 +1571,7 @@ DRAMCtrl::andXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
     bank_ref.rowAccesses   = 0;
     ++rank_ref.numBanksActive;
     assert(rank_ref.numBanksActive <= banksPerRank);
-    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    bank_ref.preAllowedAt = act_tick + pudTRAS_viol + pudTRP_viol + tRAS;
     pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
                              banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
     if (!rank_ref.activateEvent.scheduled())
@@ -1583,6 +1587,7 @@ DRAMCtrl::orXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
 {
     // OR cross-subarray: APA(ref, com) → result in com rows
     // Reference subarray pre-initialised with GND (for OR threshold)
+    // Same double-violated APA timing as andXsubBank (FCDRAM §6.2).
     DPRINTF(DRAM, "OR_XSUB rank %d bank %d ref_sub %d com_sub %d at tick %d\n",
             rank_ref.rank, bank_ref.bank,
             row_ref / rowsPerSubarray, row_com / rowsPerSubarray, act_tick);
@@ -1592,7 +1597,7 @@ DRAMCtrl::orXsubBank(Rank& rank_ref, Bank& bank_ref, Tick act_tick,
     bank_ref.rowAccesses   = 0;
     ++rank_ref.numBanksActive;
     assert(rank_ref.numBanksActive <= banksPerRank);
-    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    bank_ref.preAllowedAt = act_tick + pudTRAS_viol + pudTRP_viol + tRAS;
     pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
                              banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
     if (!rank_ref.activateEvent.scheduled())

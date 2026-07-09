@@ -807,13 +807,15 @@ DRAMInterface::andXsubBank(Rank& rank_ref, Bank& bank_ref,
                             uint32_t row_ref, uint32_t row_com)
 {
     // Cross-subarray AND: APA(ref, com) → result in com rows
+    // FCDRAM §6.2: the AND/OR APA violates BOTH tRAS and tRP; only the
+    // final restore waits the full tRAS (NOT keeps a full first tRAS).
     assert(bank_ref.openRow == Bank::NO_ROW);
     bank_ref.openRow       = Bank::DOUBLE_ROW;
     bank_ref.bytesAccessed = 0;
     bank_ref.rowAccesses   = 0;
     ++rank_ref.numBanksActive;
     assert(rank_ref.numBanksActive <= banksPerRank);
-    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    bank_ref.preAllowedAt = act_tick + pudTRAS_viol + pudTRP_viol + tRAS;
     pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
                              banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
     if (!rank_ref.activateEvent.scheduled())
@@ -829,13 +831,14 @@ DRAMInterface::orXsubBank(Rank& rank_ref, Bank& bank_ref,
                            uint32_t row_ref, uint32_t row_com)
 {
     // Cross-subarray OR: APA(ref, com) → result in com rows
+    // Same double-violated APA timing as andXsubBank (FCDRAM §6.2).
     assert(bank_ref.openRow == Bank::NO_ROW);
     bank_ref.openRow       = Bank::DOUBLE_ROW;
     bank_ref.bytesAccessed = 0;
     bank_ref.rowAccesses   = 0;
     ++rank_ref.numBanksActive;
     assert(rank_ref.numBanksActive <= banksPerRank);
-    bank_ref.preAllowedAt = act_tick + tRAS + pudTRP_viol + tRAS;
+    bank_ref.preAllowedAt = act_tick + pudTRAS_viol + pudTRP_viol + tRAS;
     pudEnforceActConstraints(rank_ref, bank_ref, act_tick,
                              banksPerRank, bankGroupArch, tRRD, tRRD_L, tXAW);
     if (!rank_ref.activateEvent.scheduled())

@@ -35,17 +35,23 @@
  * Mul  : shift-add, identical schedule to the SIMDRAM runner, but every
  *        bit-row AND / full-add is built from the COTS gates above.
  *
- * COTS DDR4 also natively supports the 3-input majority (MAJ3) that prior
- * works (ComputeDRAM/FracDRAM/DRAM Bender) demonstrate and that FCDRAM's own
- * VREF-threshold mechanism yields at VREF=VDD/2. The full adder therefore uses
- * MAJ3 directly instead of reconstructing the carry out of {AND,OR,NOT}:
+ * COTS DDR4 also supports the 3-input majority (MAJ3) that prior works
+ * (ComputeDRAM/FracDRAM/PULSAR) demonstrate via simultaneous multi-row
+ * activation. The full adder uses MAJ3 directly instead of reconstructing
+ * the carry out of {AND,OR,NOT}:
  *     cout = MAJ(a, b, cin)
  *     sum  = MAJ(~cout, cin, MAJ(a, b, ~cout))    ; a XOR b XOR cin
- * This is 8 row-ops (vs. 16 for the {AND,OR,NOT} expansion), and each MAJ3 is
- * ~half the latency of an xsub gate. Each gate is in-place on its first
- * operand (com = com OP ref / com = MAJ(com,s1,s2)), so we stage through
- * control scratch rows B_T0..B_T3 (allocated by init_ambit). C_0 is used as
- * the constant-0 row; gem5 SE zero-fills fresh pages, so C_0 reads as logic-0
+ *
+ * The cost model follows the mechanisms as characterised on real chips:
+ * both AND/OR operands live in the compute subarray as an activation pair
+ * (the neighbouring reference subarray holds only constants, re-initialised
+ * before every gate: FRAC'd VDD/2 row + threshold row); cross-subarray
+ * gates cover half a row per APA (open-bitline), so each issues one APA per
+ * neighbour side; MAJ is destructive (all activated rows get the majority
+ * value) so surviving operands are staged into scratch copies and the VDD/2
+ * helper is re-FRAC'd per MAJ.  A bit-row AND is 8 row-ops and a full adder
+ * 17 row-ops (see execute_row_and / execute_row_add).  C_0 is the
+ * constant-0 row; gem5 SE zero-fills fresh pages, so C_0 reads as logic-0
  * without an explicit initialisation, exactly as in the SIMDRAM runner.
  * --------------------------------------------------------------------- */
 #define NUM_BANKS 128   /* max banks in the CIMTRACE 128-bit bank-mask format */
@@ -70,6 +76,8 @@
     rowop_not_xsub(BANK_ROW((dst), (bank)), BANK_ROW((src), (bank)))
 #define MAJ3_ONE_BANK(com, s1, s2, bank) \
     rowop_maj3(BANK_ROW((com), (bank)), BANK_ROW((s1), (bank)), BANK_ROW((s2), (bank)))
+#define FRAC_ONE_BANK(dst, bank) \
+    rowop_frac(BANK_ROW((dst), (bank)))
 
 /* -----------------------------------------------------------------------
  * Verbosity level (set via -v / -vv command-line flag):
@@ -141,37 +149,61 @@ static inline void g_maj3(unsigned *com, unsigned *s1, unsigned *s2,
                           const int *bk, int n) {
     for (int i = 0; i < n; i++) MAJ3_ONE_BANK(com, s1, s2, bk[i]);
 }
+static inline void g_frac(unsigned *dst, const int *bk, int n) {
+    for (int i = 0; i < n; i++) FRAC_ONE_BANK(dst, bk[i]);
+}
 
 /* -----------------------------------------------------------------------
  * Bit-serial primitives used by execute_add and execute_mul.
  * --------------------------------------------------------------------- */
 
-/* out_bit = lhs_bit AND rhs_bit  (single COTS AND_XSUB after a copy). */
+/* out_bit = lhs_bit AND rhs_bit.
+ *
+ * FCDRAM AND (paper §6.1): both operands are cloned into a simultaneously-
+ * activated row pair in the COMPUTE subarray ({out, B_T1}); the neighbouring
+ * REFERENCE subarray holds only constants (a VDD threshold row + a VDD/2 row
+ * set by Frac).  Each gate overwrites its reference pair with the NAND
+ * byproduct (§6.1.3), so the threshold row is re-cloned from C_1 and the
+ * VDD/2 row re-FRAC'd before every gate.  Open-bitline neighbours cover only
+ * HALF of a row's columns (§5 footnote 6), so one APA is issued towards each
+ * neighbour (the two AND calls are functionally idempotent).
+ * B_DCC0N / B_DCC1N stand in for the two reference rows; 8 row-ops total. */
 static inline void execute_row_and(
     unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit,
     const int *bank_ids, int bank_count)
 {
-    g_clone(out_bit, lhs_bit, bank_ids, bank_count);   /* out = lhs        */
-    g_and  (out_bit, rhs_bit, bank_ids, bank_count);   /* out = lhs AND rhs */
+    g_clone(out_bit, lhs_bit, bank_ids, bank_count);   /* pair row 0 = lhs  */
+    g_clone(B_T1,    rhs_bit, bank_ids, bank_count);   /* pair row 1 = rhs  */
+    for (int side = 0; side < 2; side++) {             /* one APA per side  */
+        g_clone(B_DCC0N, C_1, bank_ids, bank_count);   /* VDD threshold row */
+        g_frac (B_DCC1N,      bank_ids, bank_count);   /* VDD/2 row         */
+        g_and  (out_bit, B_T1, bank_ids, bank_count);  /* out = lhs AND rhs */
+    }
 }
 
 /* Full adder:  out_bit = lhs ^ rhs ^ cin,  cout_bit = MAJ(lhs, rhs, cin).
  *
- * MAJ-based decomposition using the native COTS 3-input majority (rowop_maj3)
- * instead of expanding the carry out of {AND,OR,NOT}:
+ * MAJ-based decomposition using the COTS 3-input majority (rowop_maj3):
  *     cout = MAJ(a, b, cin)
  *     sum  = MAJ(~cout, cin, MAJ(a, b, ~cout))        ; a ^ b ^ cin
  * The sum identity holds for all 8 input combinations and needs only 3-input
- * majorities plus one NOT (no 5-input MAJ, so it fits the 3-address row-op
- * ABI). g_maj3(com,s1,s2) is in-place: com = MAJ(com, s1, s2).
+ * majorities plus one NOT.
  *
- * 8 row-ops (3 CLONE + 1 NOT + 3 MAJ3 + 1 CLONE) vs. the 16-op {AND,OR,NOT}
- * expansion; MAJ3 is also ~half the latency of an xsub gate (majBank timing).
+ * MAJ via simultaneous multi-row activation (FracDRAM/PULSAR) is DESTRUCTIVE:
+ * restoration writes the majority value back into ALL activated rows, and the
+ * activation group includes a VDD/2 helper row that must be re-FRAC'd before
+ * every MAJ.  Operands that must survive (b, cin, ~cout) are therefore staged
+ * into scratch copies (B_T1 / B_DCC0) that die in the MAJ; the helper row is
+ * B_DCC1N.  The cross-subarray NOT covers half a row per APA (open-bitline),
+ * so it is issued once per neighbour side (idempotent).
  *
- * Inputs lhs/rhs are never written; cin_bit is read before cout_bit is
- * written, so cout_bit may safely alias cin_bit (in-place carry) and rhs_bit
- * may alias cin_bit (as in execute_mul's last full-adder). Staging rows:
- * B_T3=cout, B_T2=~cout, B_T0=inner=MAJ(a,b,~cout). */
+ * 17 row-ops: 9 CLONE + 3 FRAC + 3 MAJ3 + 2 NOT (one per side).
+ *
+ * Inputs lhs/rhs/cin are never written (MAJ only clobbers their copies);
+ * cin is last read at the B_T1 staging clone before the sum MAJ, so cout_bit
+ * may safely alias cin_bit (in-place carry) and rhs_bit may alias cin_bit
+ * (as in execute_mul's last full-adder). Staging rows: B_T3=cout, B_T2=~cout,
+ * B_T0=inner=MAJ(a,b,~cout). */
 static inline void execute_row_add(
     unsigned *lhs_bit, unsigned *rhs_bit, unsigned *out_bit,
     unsigned *cin_bit, unsigned *cout_bit,
@@ -180,22 +212,32 @@ static inline void execute_row_add(
     const int *bk = bank_ids;
     int n = bank_count;
 
-    /* cout = MAJ(a, b, cin) -> B_T3 */
-    g_clone(B_T3, lhs_bit, bk, n);            /* B_T3 = a                */
-    g_maj3 (B_T3, rhs_bit, cin_bit, bk, n);   /* B_T3 = MAJ(a,b,cin)=cout */
+    /* cout = MAJ(a, b, cin) -> B_T3  (b, cin staged; copies die in the MAJ) */
+    g_clone(B_T3,   lhs_bit, bk, n);          /* B_T3   = a                */
+    g_clone(B_T1,   rhs_bit, bk, n);          /* B_T1   = b                */
+    g_clone(B_DCC0, cin_bit, bk, n);          /* B_DCC0 = cin              */
+    g_frac (B_DCC1N,         bk, n);          /* VDD/2 helper row          */
+    g_maj3 (B_T3, B_T1, B_DCC0, bk, n);       /* B_T3 = MAJ(a,b,cin)=cout  */
 
-    /* ~cout -> B_T2 */
-    g_not  (B_T2, B_T3, bk, n);               /* B_T2 = ~cout            */
+    /* ~cout -> B_T2  (one APA per neighbour side, idempotent) */
+    g_not  (B_T2, B_T3, bk, n);               /* B_T2 = ~cout (half row)   */
+    g_not  (B_T2, B_T3, bk, n);               /* B_T2 = ~cout (other half) */
 
-    /* inner = MAJ(a, b, ~cout) -> B_T0 */
-    g_clone(B_T0, lhs_bit, bk, n);            /* B_T0 = a                */
-    g_maj3 (B_T0, rhs_bit, B_T2, bk, n);      /* B_T0 = MAJ(a,b,~cout)   */
+    /* inner = MAJ(a, b, ~cout) -> B_T0  (~cout staged so B_T2 survives) */
+    g_clone(B_T0,   lhs_bit, bk, n);          /* B_T0   = a                */
+    g_clone(B_T1,   rhs_bit, bk, n);          /* B_T1   = b (fresh copy)   */
+    g_clone(B_DCC0, B_T2,    bk, n);          /* B_DCC0 = ~cout            */
+    g_frac (B_DCC1N,         bk, n);
+    g_maj3 (B_T0, B_T1, B_DCC0, bk, n);       /* B_T0 = MAJ(a,b,~cout)     */
 
-    /* sum = MAJ(~cout, cin, inner) -> out_bit  (reads cin before cout write) */
-    g_clone(out_bit, B_T2, bk, n);            /* out_bit = ~cout         */
-    g_maj3 (out_bit, cin_bit, B_T0, bk, n);   /* out_bit = a^b^cin = sum */
+    /* sum = MAJ(~cout, cin, inner) -> out_bit  (cin staged: the MAJ would
+     * destroy it, and it may be the C_0 constant or a live carry row) */
+    g_clone(out_bit, B_T2,    bk, n);         /* out_bit = ~cout           */
+    g_clone(B_T1,    cin_bit, bk, n);         /* B_T1    = cin             */
+    g_frac (B_DCC1N,          bk, n);
+    g_maj3 (out_bit, B_T1, B_T0, bk, n);      /* out_bit = a^b^cin = sum   */
 
-    /* commit carry last, so aliasing cout==cin (and rhs==cin) is safe */
+    /* commit carry last */
     g_clone(cout_bit, B_T3, bk, n);
 }
 

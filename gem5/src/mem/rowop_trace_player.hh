@@ -75,9 +75,16 @@ class RowOpTracePlayer : public MemObject
 
     // Rows per subarray (must match DRAMCtrl::rowsPerSubarray, mimdram.h
     // ROWS_PER_SUBARRAY, and trace_player.py).  slotAddr() maps slot->row
-    // linearly, so adding ROWS_PER_SUBARRAY to a slot moves it into the
-    // neighbouring subarray at the same within-subarray offset — this is how
-    // the FCDRAM backend places a cross-subarray reference row (see below).
+    // linearly, so adding/subtracting ROWS_PER_SUBARRAY to a slot moves it
+    // into a neighbouring subarray at the same within-subarray offset — this
+    // is how the FCDRAM backend addresses its cross-subarray reference rows.
+    //
+    // FCDRAM layout (3 subarrays per bank): compute rows live in the MIDDLE
+    // subarray (slotOffset = ROWS_PER_SUBARRAY shifts every slot there);
+    // the two neighbouring subarrays (slot ± ROWS_PER_SUBARRAY) hold the
+    // reference rows.  Open-bitline sharing means each neighbour's sense
+    // amps cover only HALF of a compute row's columns (FCDRAM paper, §5
+    // footnote 6), so every cross-subarray gate is issued once per side.
     static const int ROWS_PER_SUBARRAY = 512;
 
     // ------------------------------------------------------------------ //
@@ -135,6 +142,10 @@ class RowOpTracePlayer : public MemObject
     const Addr        rowStride;       // DRAM row buffer size (address stride per slot)
     const Backend     backend;         // row-op expansion backend (see enum Backend)
     const bool        bankParallel;    // all-bank mode: 1 rep bank/channel (see .py)
+    // FCDRAM: compute/data rows live in the MIDDLE of 3 subarrays so both
+    // cross-subarray neighbours (slot ± ROWS_PER_SUBARRAY) are addressable;
+    // slotAddr() adds this to every slot.  0 for single-subarray backends.
+    const int         slotOffset;
     MasterID          masterID;
 
     // ------------------------------------------------------------------ //
@@ -203,16 +214,23 @@ class RowOpTracePlayer : public MemObject
     void expandMulFcdram(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
 
     // COTS primitive emitters.  ROWCLONE is an intra-subarray copy; the *_XSUB
-    // gates are cross-subarray and read their reference from the neighbouring
-    // subarray at the com row's mirror offset (com_slot + ROWS_PER_SUBARRAY),
-    // matching the A-in-subarray-S / B-in-subarray-S+1 layout of the COTS
-    // microworkloads (e.g. MIMDRAM_ext/microworkloads/31_and_cots.c).
+    // gates are cross-subarray and address their reference rows at the com
+    // row's mirrors in BOTH neighbouring subarrays (com_slot ± RPS).  Due to
+    // open-bitline half-row coverage each gate is one APA per side (2 packets)
+    // and the AND/OR emitters also re-initialise the reference pair per side
+    // (ROWCLONE of the VDD/GND threshold row + FRAC of the VDD/2 row), since
+    // the previous gate overwrote it with the NAND/NOR byproduct (paper §6.1.3).
     void emitClone  (int dst_slot, int src_slot, const std::vector<int>& banks);
+    void emitFrac   (int dst_slot,               const std::vector<int>& banks);
     void emitAndXsub(int com_slot,               const std::vector<int>& banks);
     void emitOrXsub (int com_slot,               const std::vector<int>& banks);
     void emitNotXsub(int dst_slot,               const std::vector<int>& banks);
-    // Native COTS 3-input majority: com = MAJ(com, s1, s2), intra-subarray
-    // triple-row activation (all three slots in subarray 0).
+    // COTS 3-input majority via simultaneous multi-row activation
+    // (FracDRAM/PULSAR): com = MAJ(com, s1, s2), intra-subarray.  The
+    // activation group includes a VDD/2 helper row (SLOT_DCC1N) that must be
+    // re-FRAC'd before every MAJ3, and restoration writes the majority back
+    // into ALL activated rows, destroying s1/s2 — callers stage operands that
+    // must survive into scratch copies.
     void emitMaj3   (int com_slot, int s1_slot, int s2_slot,
                      const std::vector<int>& banks);
 

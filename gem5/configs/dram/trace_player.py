@@ -75,14 +75,15 @@ parser.add_option("--addr-map", type="string", default="",
 # Row-op expansion backend.  Each backend lowers the same CIMTRACE schedule
 # onto a different PuD substrate and needs a different number of subarrays:
 #   simdram : Ambit AAP/AP, all rows in one subarray            (94_...)
-#   fcdram  : COTS cross-subarray gates need com + ref rows in
-#             two neighbouring subarrays                        (96_...)
+#   fcdram  : compute rows in the middle subarray, reference
+#             rows in BOTH neighbouring subarrays (open-bitline
+#             half-row coverage needs one APA per side)         (96_...)
 # To add a backend: register its name -> subarray count here and add the
 # matching expand* implementation in src/mem/rowop_trace_player.cc.
 # ---------------------------------------------------------------------------
 BACKEND_SUBARRAYS = {
     "simdram": 1,
-    "fcdram":  2,
+    "fcdram":  3,
 }
 
 parser.add_option("--backend", type="choice",
@@ -171,10 +172,11 @@ row_stride = (int(tmp.device_rowbuffer_size.getValue()) *
 
 # Per-channel address space: subarrays_needed * ROWS_PER_SUBARRAY row-buffer
 # rows per local bank (rounded up to the next power of 2 so DRAMCtrl geometry
-# checks pass).  The FCDRAM backend needs 2 neighbouring subarrays per bank so
-# a compute row and its cross-subarray reference row are both addressable;
-# SIMDRAM needs only 1.  rows_per_bank = subarrays_needed * ROWS_PER_SUBARRAY
-# then stays a multiple of ROWS_PER_SUBARRAY, as DRAMCtrl requires.
+# checks pass).  The FCDRAM backend needs 3 subarrays per bank (compute rows
+# in the middle one, reference rows in both neighbours, one XSUB APA per
+# side); SIMDRAM needs only 1.  rows_per_bank = subarrays_needed *
+# ROWS_PER_SUBARRAY then stays a multiple of ROWS_PER_SUBARRAY, as DRAMCtrl
+# requires.
 subarrays_needed = BACKEND_SUBARRAYS[options.backend]
 channel_size_min = subarrays_needed * ROWS_PER_SUBARRAY * banks_per_channel * row_stride
 channel_size = 1 << int(math.ceil(math.log(channel_size_min, 2)))
