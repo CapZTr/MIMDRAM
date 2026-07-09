@@ -6,6 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "base/cprintf.hh"
 #include "base/trace.hh"
 #include "debug/RowOpTracePlayer.hh"
 #include "mem/packet.hh"
@@ -104,6 +105,7 @@ RowOpTracePlayer::parseBackend(const std::string& name)
 RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
     : MemObject(p),
       port("port", *this),
+      perChannel(p->per_channel),
       traceFile(p->trace_file),
       baseAddr(p->base_addr),
       banksPerChannel(p->banks_per_channel),
@@ -118,8 +120,15 @@ RowOpTracePlayer::RowOpTracePlayer(const RowOpTracePlayerParams* p)
       firstOpSeen(false), firstOpTick(0), lastOpTick(0),
       lhsBase(SLOT_DATA_BASE), rhsBase(0), outBase(0),
       partialBase(0), tmpBase(0), carryBase(0),
-      sendEvent(this)
+      sendEvent(this),
+      chanSendEvent(this)
 {
+    // One master port per connected channel (VectorMasterPort "chan_port").
+    for (int i = 0; i < p->port_chan_port_connection_count; ++i) {
+        chanPorts.push_back(
+            new ChanMasterPort(csprintf("%s.chan_port[%d]", name(), i),
+                               *this, i));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +140,8 @@ RowOpTracePlayer::getMasterPort(const std::string& if_name, PortID idx)
 {
     if (if_name == "port")
         return port;
+    if (if_name == "chan_port" && (size_t)idx < chanPorts.size())
+        return *chanPorts[idx];
     return MemObject::getMasterPort(if_name, idx);
 }
 
@@ -817,8 +828,18 @@ RowOpTracePlayer::startup()
 {
     loadTrace();
 
-    if (!pendingOps.empty())
+    if (pendingOps.empty())
+        return;
+
+    if (perChannel) {
+        if (chanPorts.empty())
+            panic("RowOpTracePlayer: per_channel set but no chan_port "
+                  "connected");
+        partitionGroup(0);
+        schedule(&chanSendEvent, curTick());
+    } else {
         schedule(&sendEvent, curTick());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -830,20 +851,24 @@ RowOpTracePlayer::startup()
 // group lives in recvTimingResp.
 // ---------------------------------------------------------------------------
 
+PacketPtr
+RowOpTracePlayer::makeOpPacket(size_t idx)
+{
+    const PendingOp& op = pendingOps[idx];
+    Addr dest = slotAddr(op.dest_slot, op.dest_bank);
+    Addr src1 = slotAddr(op.src1_slot, op.src1_bank);
+    Addr src2 = (op.op == Request::ROWCOPY) ? 0
+                                             : slotAddr(op.src2_slot, op.src2_bank);
+    return makeRowOpPacket(op.op, dest, src1, src2);
+}
+
 void
 RowOpTracePlayer::sendNextOp()
 {
     size_t groupEnd = groupEnds[curGroup];
 
     while (issueIdx < groupEnd) {
-        const PendingOp& op = pendingOps[issueIdx];
-
-        Addr dest = slotAddr(op.dest_slot, op.dest_bank);
-        Addr src1 = slotAddr(op.src1_slot, op.src1_bank);
-        Addr src2 = (op.op == Request::ROWCOPY) ? 0
-                                                 : slotAddr(op.src2_slot, op.src2_bank);
-
-        PacketPtr pkt = makeRowOpPacket(op.op, dest, src1, src2);
+        PacketPtr pkt = makeOpPacket(issueIdx);
 
         if (!port.sendTimingReq(pkt)) {
             // Back-pressure: stash and resume from recvReqRetry.
@@ -921,6 +946,109 @@ RowOpTracePlayer::recvReqRetry()
     numPacketsSent++;
     if (!firstOpSeen) { firstOpSeen = true; firstOpTick = curTick(); }
     sendNextOp();
+}
+
+// ===========================================================================
+// Per-channel issue engine (perChannel == true)
+//
+// The start-group barrier is preserved: only the current start-group's ops are
+// in flight.  Within that group each channel drains its own sub-stream in
+// order through its own port and retry slot, so back-pressure on one channel
+// no longer stalls issues to the others (removes the single-port head-of-line
+// blocking).  Per-channel order is kept (same-bank chains and same-channel
+// cross-group dependencies stay correct); only within-group cross-channel
+// issue order is relaxed, which independent DRAMCtrls have no dependency on.
+// When the whole group has completed, the next group is partitioned and pumped.
+// ===========================================================================
+void
+RowOpTracePlayer::partitionGroup(size_t g)
+{
+    size_t start = (g == 0) ? 0 : groupEnds[g - 1];
+    size_t end   = groupEnds[g];
+    size_t n     = chanPorts.size();
+
+    chanQ.assign(n, std::vector<size_t>());
+    chanCursor.assign(n, 0);
+    chanRetry.assign(n, nullptr);   // barrier guarantees no retry is in flight
+
+    for (size_t i = start; i < end; ++i) {
+        int c = opChannel(i);
+        if (c < 0 || (size_t)c >= n)
+            panic("RowOpTracePlayer: op %llu maps to channel %d, out of range "
+                  "[0,%llu)", (unsigned long long)i, c, (unsigned long long)n);
+        chanQ[c].push_back(i);
+    }
+}
+
+void
+RowOpTracePlayer::pumpChannel(size_t c)
+{
+    while (chanRetry[c] == nullptr && chanCursor[c] < chanQ[c].size()) {
+        size_t idx = chanQ[c][chanCursor[c]];
+        PacketPtr pkt = makeOpPacket(idx);
+        if (!chanPorts[c]->sendTimingReq(pkt)) {
+            chanRetry[c] = pkt;      // this channel stalls; others continue
+            numRetries++;
+            return;
+        }
+        chanCursor[c]++;
+        numPacketsSent++;
+        if (!firstOpSeen) { firstOpSeen = true; firstOpTick = curTick(); }
+    }
+}
+
+void
+RowOpTracePlayer::chanPumpAll()
+{
+    for (size_t c = 0; c < chanPorts.size(); ++c)
+        pumpChannel(c);
+}
+
+bool
+RowOpTracePlayer::recvTimingRespChan(int ch, PacketPtr pkt)
+{
+    delete pkt->req;
+    delete pkt;
+
+    completedCount++;
+    lastOpTick = curTick();
+
+    // Dependency barrier: advance to the next start-group only once every op of
+    // the current group has retired (mirror of the single-port engine).
+    if (completedCount >= groupEnds[curGroup]) {
+        if (completedCount >= pendingOps.size()) {
+            rowOpMakespan = lastOpTick - firstOpTick;
+            inform("RowOpTracePlayer: all %llu packets completed, exiting "
+                   "(row-op makespan %llu ticks over %llu start-groups)",
+                   (unsigned long long)pendingOps.size(),
+                   (unsigned long long)(lastOpTick - firstOpTick),
+                   (unsigned long long)groupEnds.size());
+            exitSimLoop("RowOpTracePlayer: trace replay complete");
+            return true;
+        }
+        curGroup++;
+        partitionGroup(curGroup);
+        schedule(&chanSendEvent, curTick() + 1);
+    }
+    return true;
+}
+
+void
+RowOpTracePlayer::recvReqRetryChan(int ch)
+{
+    assert(chanRetry[ch] != nullptr);
+
+    if (!chanPorts[ch]->sendTimingReq(chanRetry[ch])) {
+        numRetries++;
+        return;                      // still blocked on this channel
+    }
+
+    // Stashed packet accepted: count it and resume issuing this channel.
+    chanRetry[ch] = nullptr;
+    chanCursor[ch]++;
+    numPacketsSent++;
+    if (!firstOpSeen) { firstOpSeen = true; firstOpTick = curTick(); }
+    pumpChannel(ch);
 }
 
 RowOpTracePlayer*

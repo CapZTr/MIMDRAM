@@ -8,6 +8,17 @@ class RowOpTracePlayer(MemObject):
 
     port = MasterPort("Master port to send row op packets")
 
+    # Per-channel issue path: one master port per channel, each with its own
+    # retry slot, so back-pressure on one channel does not stall issues to the
+    # others (removes the single-port head-of-line blocking).  Left unconnected
+    # in the default single-port mode.  The start-group dependency barrier is
+    # preserved in this mode; only within-group cross-channel head-of-line
+    # blocking is removed.
+    chan_port = VectorMasterPort("Per-channel master ports")
+    per_channel = Param.Bool(False,
+        "Use the per-channel issue engine (one port + retry slot per channel); "
+        "False = legacy single-port engine")
+
     trace_file = Param.String("Path to the CIMTRACE binary file")
 
     base_addr = Param.Addr(0, "Base address (start of channel 0)")

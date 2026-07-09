@@ -133,8 +133,33 @@ class RowOpTracePlayer : public MemObject
     TraceMasterPort port;
 
     // ------------------------------------------------------------------ //
+    // Per-channel master port: carries a channel id so retries and responses
+    // route to that channel's independent state.  One per channel, each with
+    // its own gem5 retry slot, so a stall on channel c does not block issues to
+    // the other channels.  Used only when perChannel is true.
+    // ------------------------------------------------------------------ //
+    class ChanMasterPort : public MasterPort {
+      public:
+        ChanMasterPort(const std::string& n, RowOpTracePlayer& p, int ch)
+            : MasterPort(n, &p), player(p), chan(ch) {}
+      protected:
+        bool recvTimingResp(PacketPtr pkt)
+            { return player.recvTimingRespChan(chan, pkt); }
+        void recvReqRetry() { player.recvReqRetryChan(chan); }
+        void recvTimingSnoopReq(PacketPtr)  {}
+        void recvFunctionalSnoop(PacketPtr) {}
+        Tick recvAtomicSnoop(PacketPtr)     { return 0; }
+      private:
+        RowOpTracePlayer& player;
+        int chan;
+    };
+
+    std::vector<ChanMasterPort*> chanPorts;
+
+    // ------------------------------------------------------------------ //
     // Parameters / IDs
     // ------------------------------------------------------------------ //
+    const bool        perChannel;      // use the per-channel issue engine
     const std::string traceFile;
     const Addr        baseAddr;
     const int         banksPerChannel; // banks per DRAMCtrl instance
@@ -165,6 +190,17 @@ class RowOpTracePlayer : public MemObject
     size_t    issueIdx;              // next pendingOps index to issue
     size_t    completedCount;        // total responses received
     PacketPtr retryPkt;
+
+    // ------------------------------------------------------------------ //
+    // Per-channel engine state (used only when perChannel is true).  The
+    // start-group barrier is kept: only the CURRENT start-group's ops are
+    // partitioned across channels, each channel draining its own sub-stream
+    // (in order) through its own port + retry slot.  When the whole group has
+    // completed, the next group is partitioned and pumped.
+    // ------------------------------------------------------------------ //
+    std::vector<std::vector<size_t>> chanQ;      // current group's ops per channel
+    std::vector<size_t>    chanCursor;           // next slot in chanQ[c]
+    std::vector<PacketPtr> chanRetry;            // retry pkt per channel (null=none)
 
     // Row-op makespan: tick the first row-op is accepted by the memory and
     // tick the last row-op completes.  Their difference is the wall-clock span
@@ -245,12 +281,27 @@ class RowOpTracePlayer : public MemObject
     Addr      slotAddr(int slot, int bank) const;
     PacketPtr makeRowOpPacket(Request::RowOp op,
                                Addr dest, Addr src1, Addr src2);
+    // Build the DRAM packet for pendingOps[idx] (shared by both engines).
+    PacketPtr makeOpPacket(size_t idx);
+    // Channel a pending op targets: dest bank's owning DRAMCtrl.
+    int       opChannel(size_t idx) const
+        { return pendingOps[idx].dest_bank / banksPerChannel; }
 
     // ------------------------------------------------------------------ //
     // Send-event (declare sendNextOp BEFORE the EventWrapper)
     // ------------------------------------------------------------------ //
     void sendNextOp();
     EventWrapper<RowOpTracePlayer, &RowOpTracePlayer::sendNextOp> sendEvent;
+
+    // ------------------------------------------------------------------ //
+    // Per-channel engine (used only when perChannel is true)
+    // ------------------------------------------------------------------ //
+    void partitionGroup(size_t g);   // fill chanQ[] with group g's ops
+    void pumpChannel(size_t c);      // issue channel c until back-pressure
+    void chanPumpAll();              // the per-channel send step (all channels)
+    bool recvTimingRespChan(int ch, PacketPtr pkt);
+    void recvReqRetryChan(int ch);
+    EventWrapper<RowOpTracePlayer, &RowOpTracePlayer::chanPumpAll> chanSendEvent;
 
   public:
 

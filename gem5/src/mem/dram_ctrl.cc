@@ -1659,6 +1659,11 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
         // Wait for earliest allowed activate
         cmd_at = std::max(cmd_at, bank.actAllowedAt);
 
+        // Tick at which this row-op's ACT command(s) issue on the CA bus.
+        // Used below to free the channel after the command rather than after
+        // the whole bank ACT->PRE cycle, so independent banks can pipeline.
+        Tick act_cmd_at = cmd_at;
+
         // Do sequence of activate-activate-precharge operations
         static const char* rowOpNames[] = {
             "ROWAND", "ROWOR", "ROWNOT", "ROWXOR",
@@ -1833,11 +1838,21 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 break;
         }
 
-        // Update times, similar to code below
+        // The response is ready when the bank's ACT..PRE cycle completes
+        // (cmd_at was advanced through the aap/precharge chain) plus tCL.
         dram_pkt->readyTime = cmd_at + tCL;
         activeRank = dram_pkt->rank;
-        busBusyUntil = dram_pkt->readyTime;
-        nextReqTime = busBusyUntil - (tRP + tRCD + tCL); // TODO not sure what this is about
+
+        // The CHANNEL command bus is occupied only by the activate command,
+        // NOT by the bank's whole ACT->PRE lifetime.  Free it one command
+        // window after the ACT so a row-op to a *different* bank can issue.
+        // Cross-bank pacing (tRRD / tXAW) and same-bank pacing (tRAS / tRP)
+        // are already carried in bank.actAllowedAt by aapBank()/prechargeBank(),
+        // so the next request lands at act_cmd_at + tRRD (different bank) or at
+        // the full bank cycle (same bank) -- letting banks pipeline instead of
+        // serializing the channel for one bank's entire operation.
+        busBusyUntil = std::max(busBusyUntil, act_cmd_at + tCK);
+        nextReqTime  = act_cmd_at + tCK;
         pendingRowOps--;
 
         return;

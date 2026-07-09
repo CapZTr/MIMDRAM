@@ -104,6 +104,23 @@ parser.add_option("--all-bank", action="store_true", default=False,
                        "and makes the runtime comparable to OptiPIM. Default off "
                        "(legacy per-bank, channel-serialized).")
 
+parser.add_option("--max-tick", type="long", default=0,
+                  help="Stop the simulation after this many ticks (0 = run to "
+                       "completion)")
+
+parser.add_option("--per-channel", action="store_true", default=False,
+                  help="Use the per-channel issue engine (one player port per "
+                       "channel, each with its own retry slot) to remove "
+                       "single-port head-of-line blocking. The start-group "
+                       "dependency barrier is preserved.")
+
+parser.add_option("--membus-width", type="int", default=32,
+                  help="IOXBar membus width in bytes (default 32); raise to "
+                       "probe interconnect throughput limits")
+
+parser.add_option("--membus-clock", type="string", default="2.0GHz",
+                  help="Membus/system clock (default 2.0GHz)")
+
 (options, args) = parser.parse_args()
 
 if not options.trace:
@@ -187,9 +204,9 @@ base_addr = 0
 # System + clock
 # ---------------------------------------------------------------------------
 
-system = System(membus=IOXBar(width=32))
+system = System(membus=IOXBar(width=options.membus_width))
 system.clk_domain = SrcClockDomain(
-    clock='2.0GHz',
+    clock=options.membus_clock,
     voltage_domain=VoltageDomain(voltage='1V'))
 
 system.mem_ranges = [AddrRange(base_addr,
@@ -227,9 +244,16 @@ system.player = RowOpTracePlayer(
     channel_size      = channel_size,
     row_stride        = row_stride,
     backend           = options.backend,
-    bank_parallel     = options.all_bank)
+    bank_parallel     = options.all_bank,
+    per_channel       = options.per_channel)
 
+# Single-port path is always bound (idle in per-channel mode).
 system.player.port = system.membus.slave
+if options.per_channel:
+    # One master port per channel; the membus routes each by address to its
+    # controller, and each port carries its own retry slot.
+    system.player.chan_port = [system.membus.slave
+                               for _ in range(num_channels)]
 system.system_port = system.membus.slave
 
 # ---------------------------------------------------------------------------
@@ -257,6 +281,9 @@ print "  Backend        : %s  (%d subarray(s)/bank)" % (
 print "  Bank mode      : %s" % (
     "all-bank parallel (1 rep bank/channel)" if options.all_bank
     else "per-bank (channel-serialized)")
+print "  Issue engine   : %s" % (
+    "per-channel (independent retry/channel)" if options.per_channel
+    else "single-port")
 print "  Channels       :", num_channels
 print "  Total banks    :", banks_per_channel * num_channels
 print "  Row stride     : %d B  (DRAM row buffer size)" % row_stride
@@ -265,8 +292,9 @@ print "  Addr map       :", addr_map_str
 print "=" * 64
 print ""
 
-exit_event = m5.simulate()
-print "Simulation exited:", exit_event.getCause()
+exit_event = m5.simulate(options.max_tick if options.max_tick > 0
+                         else m5.MaxTick)
+print "Simulation exited:", exit_event.getCause(), "@ tick", m5.curTick()
 
 m5.stats.dump()
 
