@@ -94,7 +94,7 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     maxAccessesPerRow(p->max_accesses_per_row),
     frontendLatency(p->static_frontend_latency),
     backendLatency(p->static_backend_latency),
-    busBusyUntil(0), prevArrival(0),
+    busBusyUntil(0), rowStreamBusUntil(0), prevArrival(0),
     nextReqTime(0), activeRank(0), timeStampOffset(0)
 {
     // sanity check the ranks since we rely on bit slicing for the
@@ -561,7 +561,9 @@ DRAMCtrl::addToWriteQueue(PacketPtr pkt, unsigned int pktCount)
             bool no_src1 = (addrs->op == Request::ROWAP   ||
                             addrs->op == Request::ROWANAP  ||
                             addrs->op == Request::ROWAAAP  ||
-                            addrs->op == Request::ROWAAAAAP);
+                            addrs->op == Request::ROWAAAAAP ||
+                            addrs->op == Request::ROW_RD_STREAM ||
+                            addrs->op == Request::ROW_WR_STREAM);
             bool no_src2 = (no_src1 ||
                             addrs->op == Request::ROWNOT   ||
                             addrs->op == Request::ROWAAP   ||
@@ -1670,7 +1672,8 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
             "ROWAP", "ROWAAP", "ROWCOPY",
             "ROWANAP", "ROWAAAP", "ROWAAAAAP",
             "ROWCLONE", "MRC", "MAJ", "BULK_WRITE",
-            "NOT_XSUB", "AND_XSUB", "OR_XSUB", "FRAC", "MAJ3"
+            "NOT_XSUB", "AND_XSUB", "OR_XSUB", "FRAC", "MAJ3",
+            "ROW_RD_STREAM", "ROW_WR_STREAM"
         };
         DPRINTF(DRAM, "RowOp %s rank %d bank %d dest_row %d src1_row %d src2_row %d\n",
                 rowOpNames[dram_pkt->row_op],
@@ -1746,6 +1749,47 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
             case Request::MAJ3: // In-place 3-input MAJ (charge-sharing MAJ timing, no range assert)
                 maj3Bank(rank, bank, cmd_at, dram_pkt->src1_row, dram_pkt->row); cmd_at = bank.actAllowedAt;
                 break;
+            // Cross-channel row-copy halves.  The player splits a copy whose
+            // src and dst banks live in different channels into one
+            // ROW_RD_STREAM on the source channel and one ROW_WR_STREAM on
+            // the destination channel: each channel's data bus carries the
+            // full row exactly once (ACT, tRCD, columnsPerRowBuffer bursts,
+            // then tRTP/tWR recovery and PRE), and the two halves pipeline
+            // like a host-buffered DMA.  Streams in the same channel
+            // serialise on the data bus via rowStreamBusUntil; AAP-style
+            // (CA-bus-only) row-ops may still overlap a stream.
+            case Request::ROW_RD_STREAM: {
+                // Delay the ACT until the data bus is about to be free
+                // (instead of holding the row open while queueing): keeps
+                // the bank's active window short and fixed so refresh can
+                // slot in between streams, as a real controller would.
+                Tick act_at = std::max(cmd_at,
+                                       rowStreamBusUntil > tRCD ?
+                                       rowStreamBusUntil - tRCD : 0);
+                activateBank(rank, bank, act_at, dram_pkt->row);
+                Tick col_at  = bank.colAllowedAt;   // >= rowStreamBusUntil
+                Tick end_at  = col_at + columnsPerRowBuffer * tBURST;
+                Tick pre_at  = std::max(bank.preAllowedAt,
+                                        col_at + (columnsPerRowBuffer - 1) * tBURST + tRTP);
+                prechargeBank(rank, bank, pre_at);
+                rowStreamBusUntil = end_at;
+                cmd_at = end_at;
+                break;
+            }
+            case Request::ROW_WR_STREAM: {
+                Tick act_at = std::max(cmd_at,
+                                       rowStreamBusUntil > tRCD ?
+                                       rowStreamBusUntil - tRCD : 0);
+                activateBank(rank, bank, act_at, dram_pkt->row);
+                Tick col_at  = bank.colAllowedAt;   // >= rowStreamBusUntil
+                Tick end_at  = col_at + columnsPerRowBuffer * tBURST;
+                Tick pre_at  = std::max(bank.preAllowedAt,
+                                        col_at + (columnsPerRowBuffer - 1) * tBURST + tWR);
+                prechargeBank(rank, bank, pre_at);
+                rowStreamBusUntil = end_at;
+                cmd_at = end_at;
+                break;
+            }
             case Request::ROWCOPY: {
                 bool same_subarray =
                     dram_pkt->src_rank == dram_pkt->rank &&

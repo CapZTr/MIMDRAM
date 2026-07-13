@@ -897,7 +897,8 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick cmd_at,
             "ROWAP","ROWAAP","ROWCOPY",
             "ROWANAP","ROWAAAP","ROWAAAAAP",
             "ROWCLONE","MRC","MAJ","BULK_WRITE",
-            "NOT_XSUB","AND_XSUB","OR_XSUB","FRAC","MAJ3"
+            "NOT_XSUB","AND_XSUB","OR_XSUB","FRAC","MAJ3",
+            "ROW_RD_STREAM","ROW_WR_STREAM"
         };
         DPRINTF(DRAM, "RowOp %s rank %d bank %d dst %d src1 %d src2 %d\n",
                 rowOpNames[mem_pkt->row_op],
@@ -973,6 +974,32 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick cmd_at,
                 // In-place 3-input MAJ: same charge-sharing MAJ timing as MAJ.
                 majBank(rank, bank, cmd_at, mem_pkt->src1_row, mem_pkt->row); cmd_at = bank.actAllowedAt;
                 break;
+            // Cross-channel row-copy halves (see dram_ctrl.cc for the full
+            // rationale): one channel-side full-row stream each — ACT,
+            // tRCD, columnsPerRowBuffer bursts, tRTP/tWR recovery, PRE.
+            // This interface path has no per-channel stream-bus guard
+            // (rowStreamBusUntil lives in DRAMCtrl, the measured player
+            // path); per-bank chaining still applies.
+            case Request::ROW_RD_STREAM: {
+                activateBank(rank, bank, cmd_at, mem_pkt->row);
+                Tick col_at = bank.colAllowedAt;
+                Tick end_at = col_at + columnsPerRowBuffer * tBURST;
+                Tick pre_at = std::max(bank.preAllowedAt,
+                                       col_at + (columnsPerRowBuffer - 1) * tBURST + tRTP);
+                prechargeBank(rank, bank, pre_at);
+                cmd_at = end_at;
+                break;
+            }
+            case Request::ROW_WR_STREAM: {
+                activateBank(rank, bank, cmd_at, mem_pkt->row);
+                Tick col_at = bank.colAllowedAt;
+                Tick end_at = col_at + columnsPerRowBuffer * tBURST;
+                Tick pre_at = std::max(bank.preAllowedAt,
+                                       col_at + (columnsPerRowBuffer - 1) * tBURST + tWR);
+                prechargeBank(rank, bank, pre_at);
+                cmd_at = end_at;
+                break;
+            }
             case Request::ROWCOPY: {
                 // Inter-bank / inter-rank row copy: read src, write dst
                 Rank& src_rank_ref = *ranks[mem_pkt->src_rank];

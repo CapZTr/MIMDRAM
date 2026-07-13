@@ -475,6 +475,14 @@ AbstractMemory::access(PacketPtr pkt)
                     *src2++ = m;
                 }
                 break;
+            case Request::ROW_RD_STREAM:
+            case Request::ROW_WR_STREAM:
+                // Cross-channel row-copy halves: each packet models one
+                // channel's side of the transfer (timing only).  The player
+                // addresses each half within its own channel, so there is no
+                // cross-channel pointer to touch here; the payload rows are
+                // opaque like the other timing-only PuD handlers.
+                break;
             default:
                 assert(false);
                 break;

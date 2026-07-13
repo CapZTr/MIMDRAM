@@ -219,7 +219,13 @@ class Request
         AND_XSUB,    // Cross-subarray AND: init ref rows → APA(ref, com) → result in com rows
         OR_XSUB,     // Cross-subarray OR:  init ref rows → APA(ref, com) → result in com rows
         FRAC,        // VDD/2 init: (ACT → PRE_viol) × frac_iters
-        MAJ3         // In-place 3-input MAJ: dest = MAJ(dest, src1, src2); MAJ-latency timing
+        MAJ3,        // In-place 3-input MAJ: dest = MAJ(dest, src1, src2); MAJ-latency timing
+        // Cross-channel row-copy halves: each involved channel streams the
+        // full row over its own data bus once (ACT → tRCD → C bursts →
+        // tRTP/tWR → PRE); the two halves live in different channels and
+        // pipeline like a host-buffered DMA.
+        ROW_RD_STREAM, // source-channel half: stream the row out (read)
+        ROW_WR_STREAM  // destination-channel half: stream the row in (write)
     };
 
     struct RowOpPayload {

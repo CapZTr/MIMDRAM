@@ -258,6 +258,18 @@ void RowOpTracePlayer::emitCopy(int dst_slot, int dst_bank,
                           0, 0});
 }
 
+void RowOpTracePlayer::emitRdStream(int slot, int bank)
+{
+    pendingOps.push_back({Request::ROW_RD_STREAM,
+                          slot, bank, slot, bank, 0, bank});
+}
+
+void RowOpTracePlayer::emitWrStream(int slot, int bank)
+{
+    pendingOps.push_back({Request::ROW_WR_STREAM,
+                          slot, bank, slot, bank, 0, bank});
+}
+
 // ---------------------------------------------------------------------------
 // Composite emitters (match C helpers in 94_simdram_schedule_runner.c)
 // ---------------------------------------------------------------------------
@@ -778,10 +790,15 @@ RowOpTracePlayer::expandMulPrada(int lhs_bw, int rhs_bw,
 // Cross-channel copy: the ROWCOPY primitive in abstract_mem.cc accesses
 // both dest and src1 relative to a single channel's pmemAddr base.  When
 // the two banks are in different channels the src1 offset would go out of
-// bounds and crash.  Model the inter-channel transfer as two ROWAP
-// activations instead -- one on the source side (read) and one on the
-// destination side (write).  This is a timing approximation but keeps
-// all address arithmetic within a single channel's backing store.
+// bounds and crash.  Model the inter-channel transfer as one full-row
+// data-bus stream per side: ROW_RD_STREAM on the source channel (ACT +
+// tRCD + columnsPerRowBuffer bursts out + tRTP + PRE) and ROW_WR_STREAM
+// on the destination channel (same, with tWR recovery).  Each channel's
+// data bus carries the row exactly once and the two sides pipeline like a
+// host-buffered DMA (host interconnect bandwidth is assumed to not be the
+// bottleneck).  This replaces the old 2-bare-ROWAP approximation, which
+// charged no data movement at all and made a cross-channel copy cheaper
+// than an intra-subarray RowClone FPM copy.
 // ---------------------------------------------------------------------------
 void
 RowOpTracePlayer::expandRowCopy(int bw, int src_bank, int dst_bank)
@@ -793,11 +810,9 @@ RowOpTracePlayer::expandRowCopy(int bw, int src_bank, int dst_bank)
         for (int j = 0; j < bw; j++)
             emitCopy(lhsBase + j, dst_bank, outBase + j, src_bank);
     } else {
-        // Cross-channel: approximate inter-channel data transfer as
-        // ROWAP on src (row read) + ROWAP on dst (row write).
         for (int j = 0; j < bw; j++) {
-            emitAP(outBase  + j, src_bank);  // src channel: row activation
-            emitAP(lhsBase  + j, dst_bank);  // dst channel: row activation
+            emitRdStream(outBase + j, src_bank);  // src channel: row out
+            emitWrStream(lhsBase + j, dst_bank);  // dst channel: row in
         }
     }
 }

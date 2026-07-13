@@ -875,6 +875,17 @@ class DRAMCtrl : public AbstractMemory
      */
     Tick busBusyUntil;
 
+    /**
+     * Till when is this channel's data bus occupied by a row-copy
+     * streaming phase (ROW_RD_STREAM / ROW_WR_STREAM)?  Row-ops do not
+     * consult busBusyUntil, so concurrent full-row streams between
+     * different bank pairs in the same channel need their own guard to
+     * serialise on the (single) data bus.  AAP-style row-ops are
+     * CA-bus-only and legitimately overlap a stream, so they neither
+     * consult nor advance this.
+     */
+    Tick rowStreamBusUntil;
+
     Tick prevArrival;
 
     /**

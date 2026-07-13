@@ -239,6 +239,10 @@ class RowOpTracePlayer : public MemObject
     void emitAP  (int dst_slot,               int bank);
     void emitCopy(int dst_slot, int dst_bank, int src_slot, int src_bank);
 
+    // Cross-channel row-copy halves (one full-row data-bus stream per side)
+    void emitRdStream(int slot, int bank);
+    void emitWrStream(int slot, int bank);
+
     // Ambit multi-bank composite emitters
     void emitRowAnd(int lhs_slot, int rhs_slot, int out_slot,
                     const std::vector<int>& banks);
