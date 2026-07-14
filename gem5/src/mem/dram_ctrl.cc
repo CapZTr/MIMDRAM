@@ -1766,6 +1766,19 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 Tick act_at = std::max(cmd_at,
                                        rowStreamBusUntil > tRCD ?
                                        rowStreamBusUntil - tRCD : 0);
+                // Same guard as the inter-bank ROWCOPY branch: an ACT that
+                // lands while a precharge/power event is queued in this rank
+                // makes schedulePowerEvent panic; push it strictly after.
+                if (rank.prechargeEvent.scheduled())
+                    act_at = std::max(act_at, rank.prechargeEvent.when() + 1);
+                if (rank.powerEvent.scheduled())
+                    act_at = std::max(act_at, rank.powerEvent.when() + 1);
+                // Keep the drain paced to the *actual* ACT: the shared tail
+                // derives nextReqTime/busBusyUntil from act_cmd_at, and the
+                // event-collision guards above only see events scheduled so
+                // far -- letting the drain race ahead of a far-future ACT
+                // reintroduces the schedulePowerEvent panic.
+                act_cmd_at = act_at;
                 activateBank(rank, bank, act_at, dram_pkt->row);
                 Tick col_at  = bank.colAllowedAt;   // >= rowStreamBusUntil
                 Tick end_at  = col_at + columnsPerRowBuffer * tBURST;
@@ -1780,6 +1793,11 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
                 Tick act_at = std::max(cmd_at,
                                        rowStreamBusUntil > tRCD ?
                                        rowStreamBusUntil - tRCD : 0);
+                if (rank.prechargeEvent.scheduled())
+                    act_at = std::max(act_at, rank.prechargeEvent.when() + 1);
+                if (rank.powerEvent.scheduled())
+                    act_at = std::max(act_at, rank.powerEvent.when() + 1);
+                act_cmd_at = act_at;   // pace the drain to the actual ACT
                 activateBank(rank, bank, act_at, dram_pkt->row);
                 Tick col_at  = bank.colAllowedAt;   // >= rowStreamBusUntil
                 Tick end_at  = col_at + columnsPerRowBuffer * tBURST;
@@ -2426,6 +2444,16 @@ DRAMCtrl::Rank::checkDrainDone()
 void
 DRAMCtrl::Rank::processActivateEvent()
 {
+    // A row-op ACT booked ahead of time can land inside a refresh window
+    // (processRefreshEvent cannot see future activateEvents when it starts).
+    // The refresh-exit power event is already queued, so scheduling PWR_ACT
+    // now would panic; defer the power-state transition until just after
+    // the refresh exit. Packet timing bookkeeping is unaffected -- this
+    // only keeps the power-state machine consistent.
+    if (pwrState == PWR_REF && powerEvent.scheduled()) {
+        schedule(activateEvent, powerEvent.when() + 1);
+        return;
+    }
     // we should transition to the active state as soon as any bank is active
     if (pwrState != PWR_ACT)
         // note that at this point numBanksActive could be back at
