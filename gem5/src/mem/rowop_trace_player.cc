@@ -76,7 +76,10 @@ struct NormRecord {
     uint8_t  dst;
 };
 
-enum OpKind : uint8_t { OP_MULI = 0, OP_ADDI = 1, OP_ROW_COPY = 2 };
+enum OpKind : uint8_t { OP_MULI = 0, OP_ADDI = 1, OP_ROW_COPY = 2,
+                        OP_RELU = 3, OP_ADDI_WIDE = 4, OP_XNOR = 5,
+                        OP_RANGE_SCAN = 6, OP_MIN = 7, OP_MAX = 8,
+                        OP_SUBI = 9 };
 
 } // anonymous namespace
 
@@ -314,6 +317,19 @@ RowOpTracePlayer::expandAdd(int lhs_bw, int rhs_bw,
       case BK_SIMDRAM: expandAddSimdram(lhs_bw, rhs_bw, banks); break;
       case BK_FCDRAM:  expandAddFcdram (lhs_bw, rhs_bw, banks); break;
       case BK_PRADA:   expandAddPrada  (lhs_bw, rhs_bw, banks); break;
+    }
+}
+
+void
+RowOpTracePlayer::expandSub(int lhs_bw, int rhs_bw,
+                             const std::vector<int>& banks)
+{
+    switch (backend) {
+      case BK_SIMDRAM: expandSubSimdram(lhs_bw, rhs_bw, banks); break;
+      case BK_PRADA:   expandSubPrada  (lhs_bw, rhs_bw, banks); break;
+      case BK_FCDRAM:
+        panic("RowOpTracePlayer: OP_SUBI is not implemented for the fcdram "
+              "backend");
     }
 }
 
@@ -781,6 +797,552 @@ RowOpTracePlayer::expandMulPrada(int lhs_bw, int rhs_bw,
                     carryBase + 0, outBase + lhs_bw + rhs_bw - 1, banks);
 }
 
+// ===========================================================================
+// PRADA versions of the five non-arithmetic ops.
+//
+// Two properties of PRADA's substrate shape every sequence below, and they cut
+// in opposite directions against Ambit:
+//
+//   + A TRA is ONE command for a 3-row majority, where Ambit needs an AAP to
+//     stage each operand into a magic row plus an AP.  So a majority whose
+//     operands are already in place is far cheaper here.
+//   - There is NO dual-contact cell.  Ambit gets ~a for free by reading DCC0N
+//     after writing DCC0; PRADA must spend a NOT (ROWANAP) per complement.
+//
+// The operand-staging convention is inherited from the existing PRADA and:
+// a TRA is destructive in ALL THREE named rows (charge sharing drives the
+// majority back into each), so anything that must survive is copied into
+// scratch first.  The five sequences below follow emitRowAndPrada in staging
+// the caller's input slices rather than naming them in a TRA, so an input row
+// is only ever read.  (emitRowAddPrada, which predates them, does name its
+// operand rows and so consumes them; that is harmless there because
+// expandMulPrada only ever feeds it scratch, and it is a timing model either
+// way, but do not copy the pattern.)
+//
+// Slots SLOT_T0..SLOT_DCC1N are plain scratch rows here (PRADA has no magic
+// multi-row semantics), which gives eight of them; SLOT_C_0/SLOT_C_1 hold the
+// constant 0/1 rows a majority needs to degenerate into AND (third row 0) or
+// OR (third row 1).
+// ===========================================================================
+
+// out = lhs OR rhs = MAJ(lhs, rhs, 1) -- the dual of emitRowAndPrada, with the
+// third row preset to 1 instead of 0.  4 row-ops.
+void
+RowOpTracePlayer::emitRowOrPrada(int lhs_slot, int rhs_slot, int out_slot,
+                                 const std::vector<int>& banks)
+{
+    for (int b : banks) emitAAP (out_slot, SLOT_C_1,  b);  // out = 1
+    for (int b : banks) emitAAP (SLOT_T0,  lhs_slot,  b);  // T0  = lhs
+    for (int b : banks) emitAAP (SLOT_T1,  rhs_slot,  b);  // T1  = rhs
+    for (int b : banks) emitAAAP(out_slot, SLOT_T0, SLOT_T1, b);
+}
+
+// Widening add, PRADA: expandAddPrada plus the surviving carry-out row.
+// Cost 6*bw + 2 (against SIMDRAM's 8*bw + 2).  Same reason the store cannot be
+// skipped: the next add's carry initialisation overwrites SLOT_DCC1.
+void
+RowOpTracePlayer::expandAddWidePrada(int bw, const std::vector<int>& banks)
+{
+    for (int b : banks) emitAAP(SLOT_DCC1, SLOT_C_0, b);   // carry := 0
+
+    for (int j = 0; j < bw; j++)
+        emitRowAddPrada(lhsBase + j, rhsBase + j, outBase + j,
+                        SLOT_DCC1, SLOT_DCC1, banks);
+
+    for (int b : banks) emitAAP(outBase + bw, SLOT_DCC1, b);
+}
+
+// ReLU, PRADA: out[i] = lhs[i] AND ~sign.  The mask costs a single command
+// here -- PRADA's NOT writes the inverted sense-amp value straight into a
+// second row, with no dual-contact cell involved -- and then it is ANDed into
+// every bit row with the standard PRADA AND (4 ops).  emitRowAndPrada touches
+// only out/T0/T1, so the mask parked in T3 survives the whole loop.
+//
+// Cost 4*bw + 1, against SIMDRAM's 4*bw + 2.
+void
+RowOpTracePlayer::expandReluPrada(int bw, const std::vector<int>& banks)
+{
+    for (int b : banks) emitANAP(SLOT_T3, lhsBase + bw - 1, b);  // T3 = ~sign
+
+    for (int i = 0; i < bw; i++)
+        emitRowAndPrada(lhsBase + i, SLOT_T3, outBase + i, banks);
+}
+
+// XNOR, PRADA: (a OR ~b) AND (~a OR b), three majorities like the Ambit
+// version -- but each complement now costs a NOT, and each majority's operands
+// must be staged because the TRA consumes all three of its rows.  Per bit:
+//
+//   1. ANAP(T0,  a[i])          T0   = ~a
+//   2. AAP (T1,  b[i])          T1   =  b      (input rows stay intact)
+//   3. AAP (T2,  C_1)           T2   =  1
+//   4. AAAP(T2,  T0, T1)        T2   = MAJ(1,~a,b) = ~a|b
+//   5. ANAP(T3,  b[i])          T3   = ~b
+//   6. AAP (DCC0, a[i])         DCC0 =  a
+//   7. AAP (DCC1, C_1)          DCC1 =  1
+//   8. AAAP(DCC1, T3, DCC0)     DCC1 = MAJ(1,~b,a) = a|~b
+//   9. AAP (out[i], C_0)        out  =  0
+//  10. AAAP(out[i], T2, DCC1)   out  = MAJ(0, ~a|b, a|~b) = XNOR
+//
+// Step 4 clobbers T0/T1/T2 (all three then hold ~a|b), which is why steps 5-8
+// rebuild the second OR's operands in different rows; step 10 reads the two
+// OR results out of T2 and DCC1, the rows each majority was accumulated in.
+// Nothing is carried between bit positions, so this loops safely at any width.
+//
+// Cost 10 per bit, against SIMDRAM's 7: PRADA pays 2 NOTs per bit where the
+// dual-contact cells hand Ambit both complements for free, and it cannot use
+// Ambit's trick of computing both ORs with two bare APs over pre-loaded magic
+// rows.  XNOR is the one op in this set where PRADA is clearly worse -- worth
+// stating plainly, since it is the BNN multiply.
+void
+RowOpTracePlayer::expandXnorPrada(int bw, const std::vector<int>& banks)
+{
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitANAP(SLOT_T0,   lhsBase + i, b);
+        for (int b : banks) emitAAP (SLOT_T1,   rhsBase + i, b);
+        for (int b : banks) emitAAP (SLOT_T2,   SLOT_C_1,    b);
+        for (int b : banks) emitAAAP(SLOT_T2,   SLOT_T0, SLOT_T1, b);
+        for (int b : banks) emitANAP(SLOT_T3,   rhsBase + i, b);
+        for (int b : banks) emitAAP (SLOT_DCC0, lhsBase + i, b);
+        for (int b : banks) emitAAP (SLOT_DCC1, SLOT_C_1,    b);
+        for (int b : banks) emitAAAP(SLOT_DCC1, SLOT_T3, SLOT_DCC0, b);
+        for (int b : banks) emitAAP (outBase + i, SLOT_C_0,  b);
+        for (int b : banks) emitAAAP(outBase + i, SLOT_T2, SLOT_DCC1, b);
+    }
+}
+
+// BitWeaving/V BETWEEN range scan, PRADA.  Same single-bit recurrence as the
+// Ambit version (R = ">= lower", S = "<= upper", advanced by one majority
+// each), and PRADA's TRA is a particularly good fit: naming the accumulator
+// row itself as one of the three rows updates it IN PLACE, since the majority
+// is driven back into every activated row.  Per bit:
+//
+//   1. AAP (T0, col[j])       stage v            (column rows stay intact)
+//   2. ANAP(T1, col[j])       ~v
+//   3. AAP (T2, C_lower[j])   selector for R     -- branch-dependent
+//   4. AAAP(DCC0, T0, T2)     R = MAJ(R, v, sel_lo)
+//   5. AAP (T3, C_upper[j])   selector for S     -- branch-dependent
+//   6. AAAP(DCC1, T1, T3)     S = MAJ(S, ~v, sel_hi)
+//
+// As in the Ambit version the cost is branch-independent: every one of the
+// four (lower[j], upper[j]) cases emits these same six commands and differs
+// only in which constant row steps 3 and 5 read, so emitting one
+// representative branch is exact rather than approximate, and the compiler can
+// price the op from the column width alone.
+//
+// Cost 6*bw + 6: 2 to seed both chains, 6 per bit, and 4 for the final
+// mask = R AND S.  Against SIMDRAM's 4*bw + 5 -- Ambit wins here because one
+// AP advances a chain whose operands are already in its magic rows, while
+// PRADA must re-stage v and rebuild ~v every bit.
+//
+// No early termination, matching the reference implementations and the Ambit
+// path; this is an upper bound on the scan cost.
+void
+RowOpTracePlayer::expandRangeScanPrada(int bw, const std::vector<int>& banks)
+{
+    for (int b : banks) emitAAP(SLOT_DCC0, SLOT_C_1, b);   // R := 1
+    for (int b : banks) emitAAP(SLOT_DCC1, SLOT_C_1, b);   // S := 1
+
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitAAP (SLOT_T0,   lhsBase + i, b);
+        for (int b : banks) emitANAP(SLOT_T1,   lhsBase + i, b);
+        for (int b : banks) emitAAP (SLOT_T2,   SLOT_C_1,    b);
+        for (int b : banks) emitAAAP(SLOT_DCC0, SLOT_T0, SLOT_T2, b);
+        for (int b : banks) emitAAP (SLOT_T3,   SLOT_C_0,    b);
+        for (int b : banks) emitAAAP(SLOT_DCC1, SLOT_T1, SLOT_T3, b);
+    }
+
+    // mask = R AND S.  R and S are in scratch, so the standard PRADA AND
+    // applies unchanged (it stages both operands and preserves them).
+    emitRowAndPrada(SLOT_DCC0, SLOT_DCC1, outBase + 0, banks);
+}
+
+// Bit-serial min/max, PRADA: compare, then select.
+//
+// Phase 1 -- G = (a > b) = MAJ3(a[j], ~b[j], G), LSB to MSB.  Three commands
+// per bit, exactly as on Ambit, but for a different reason: PRADA spends one
+// on the complement of b and gets the majority itself for free in the TRA,
+// where Ambit spends two AAPs staging operands and one AP.  G accumulates in
+// SLOT_DCC0N -- in PRADA that is simply another scratch row, no dual-contact
+// semantics -- and the TRA updates it in place.
+//
+// Phase 2 -- out[i] = mux(G, x[i], y[i]) = (G AND x) OR (~G AND y), three
+// majorities, 10 commands per bit:
+//
+//   1. AAP (DCC0, G)          a copy of G to feed the TRA, which consumes it
+//   2. ANAP(DCC1, G)          ~G
+//   3. AAP (T0, C_0)          0
+//   4. AAP (T1, x[i])         stage x
+//   5. AAAP(T0, T1, DCC0)     T0 = MAJ(0, x, G)  = G AND x
+//   6. AAP (T2, C_0)          0
+//   7. AAP (T3, y[i])         stage y
+//   8. AAAP(T2, T3, DCC1)     T2 = MAJ(0, y, ~G) = ~G AND y
+//   9. AAP (out[i], C_1)      1
+//  10. AAAP(out[i], T0, T2)   out = MAJ(1, G&x, ~G&y) = the mux
+//
+// Steps 1-2 exist because a TRA destroys all three of its rows: G has to
+// survive every remaining bit, so it is never named directly.
+//
+// Total 13*bw + 1, one command under SIMDRAM's 13*bw + 2 -- the two substrates
+// happen to land on the same per-bit cost for this op.  max and min differ
+// only in which operand each mux branch takes.
+void
+RowOpTracePlayer::expandMinMaxPrada(int bw, const std::vector<int>& banks,
+                                   bool isMax)
+{
+    const int gSlot = SLOT_DCC0N;
+
+    // --- Phase 1: G = (a > b), seeded false so equal operands select b.
+    for (int b : banks) emitAAP(gSlot, SLOT_C_0, b);
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitAAP (SLOT_T0, lhsBase + i, b);
+        for (int b : banks) emitANAP(SLOT_T1, rhsBase + i, b);
+        for (int b : banks) emitAAAP(gSlot,   SLOT_T0, SLOT_T1, b);
+    }
+
+    // --- Phase 2: out[i] = mux(G, x[i], y[i]).
+    const int xBase = isMax ? lhsBase : rhsBase;
+    const int yBase = isMax ? rhsBase : lhsBase;
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitAAP (SLOT_DCC0,   gSlot,      b);
+        for (int b : banks) emitANAP(SLOT_DCC1,   gSlot,      b);
+        for (int b : banks) emitAAP (SLOT_T0,     SLOT_C_0,   b);
+        for (int b : banks) emitAAP (SLOT_T1,     xBase + i,  b);
+        for (int b : banks) emitAAAP(SLOT_T0,     SLOT_T1, SLOT_DCC0, b);
+        for (int b : banks) emitAAP (SLOT_T2,     SLOT_C_0,   b);
+        for (int b : banks) emitAAP (SLOT_T3,     yBase + i,  b);
+        for (int b : banks) emitAAAP(SLOT_T2,     SLOT_T3, SLOT_DCC1, b);
+        for (int b : banks) emitAAP (outBase + i, SLOT_C_1,   b);
+        for (int b : banks) emitAAAP(outBase + i, SLOT_T0, SLOT_T2, b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bit-serial subtract: out = lhs - rhs = lhs + ~rhs + 1.
+//
+// The same full-adder chain as expandAddSimdram, with two changes:
+//   * the carry is initialised to ONE (read C_1 instead of C_0), which is the
+//     +1 of the two's complement, and costs the same one AAP;
+//   * every read of the subtrahend's row becomes a read of its complement.
+//
+// The complement has to be materialised rather than read on the fly, because
+// the adder reads rhs TWICE per bit -- once into the majority that forms the
+// carry-out and once into the sum -- and a dual-contact cell only hands back
+// the complement of whatever was last written to it, which for the carry path
+// is not rhs.  So each bit stages rhs into DCC0 once (1 AAP) and then reads
+// DCC0N in both places, for 9 commands per bit against the adder's 8.
+//
+// Cost 9*bw + 1, matching getComputeLatency(SubIOp) on this backend.
+// ---------------------------------------------------------------------------
+void
+RowOpTracePlayer::expandSubSimdram(int lhs_bw, int rhs_bw,
+                                   const std::vector<int>& banks)
+{
+    int bw = std::min(lhs_bw, rhs_bw);
+
+    // init carry = 1 (the +1 of ~rhs + 1)
+    for (int b : banks) emitAAP(SLOT_DCC1, SLOT_C_1, b);
+
+    for (int j = 0; j < bw; j++) {
+        int lhs_slot = lhsBase + j;
+        int rhs_slot = rhsBase + j;
+        int out_slot = outBase + j;
+
+        // DCC0 = rhs, so DCC0N reads ~rhs for the rest of this bit step.
+        for (int b : banks) emitAAP(SLOT_DCC0,       rhs_slot,        b);
+
+        for (int b : banks) emitAAP(SLOT_T0_T1_T2,  SLOT_DCC1,      b);
+        for (int b : banks) emitAAP(SLOT_T2_T3,     lhs_slot,        b);
+        for (int b : banks) emitAAP(SLOT_DCC1,      SLOT_DCC0N,      b);
+        for (int b : banks) emitAP (SLOT_DCC1_T0_T3,                  b);
+        for (int b : banks) emitAAP(SLOT_T0_T3,     SLOT_DCC1N,      b);
+        for (int b : banks) emitAP (SLOT_T0_T1_T2,                    b);
+        for (int b : banks) emitAAP(SLOT_T1,        SLOT_DCC0N,      b);
+        for (int b : banks) emitAAP(out_slot,       SLOT_T1_T2_T3,   b);
+    }
+}
+
+// PRADA subtract: the PRADA full adder with the carry seeded to one and the
+// subtrahend inverted by PRADA's single-command NOT into T1 -- which
+// emitRowAddPrada does not write (it uses out/T2/T3/DCC0 and the carry slot),
+// so the inverted row survives the adder step.  7 commands per bit against the
+// adder's 6, i.e. 7*bw + 1.  Note this is a smaller penalty than SIMDRAM's,
+// because a NOT here is one command while Ambit needs a full AAP through a
+// dual-contact cell.
+void
+RowOpTracePlayer::expandSubPrada(int lhs_bw, int rhs_bw,
+                                 const std::vector<int>& banks)
+{
+    int bw = std::min(lhs_bw, rhs_bw);
+
+    for (int b : banks) emitAAP(SLOT_DCC1, SLOT_C_1, b);   // carry := 1
+
+    for (int j = 0; j < bw; j++) {
+        for (int b : banks) emitANAP(SLOT_T1, rhsBase + j, b);   // T1 = ~rhs
+        emitRowAddPrada(lhsBase + j, SLOT_T1, outBase + j,
+                        SLOT_DCC1, SLOT_DCC1, banks);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Widening bit-serial add: out[0..bw] = lhs[0..bw-1] + rhs[0..bw-1].
+//
+// Identical to expandAddSimdram except that the final carry -- which lives in
+// SLOT_DCC1 and survives across bit steps -- is stored into out[bw] instead of
+// being discarded.  That one extra AAP is what buys the extra result bit, and
+// it cannot be skipped: the next addition's carry initialisation overwrites
+// DCC1, so a consumer could not read it from there.
+//
+// Cost is 8*bw + 2, matching getComputeLatency(AddIFullOp) exactly.  Compare
+// with pre-extending both operands and using a truncating add, which costs
+// 8*(bw+1) + 1 -- for a 64-input popcount tree that is 1527 AAP against 1086.
+// ---------------------------------------------------------------------------
+void
+RowOpTracePlayer::expandAddWide(int bw, const std::vector<int>& banks)
+{
+    if (backend == BK_PRADA) { expandAddWidePrada(bw, banks); return; }
+    if (backend != BK_SIMDRAM)
+        panic("RowOpTracePlayer: OP_ADDI_WIDE is not implemented for the "
+              "fcdram backend");
+
+    for (int b : banks) emitAAP(SLOT_DCC1, SLOT_C_0, b);   // carry = 0
+
+    for (int j = 0; j < bw; j++) {
+        int lhs_slot = lhsBase + j;
+        int rhs_slot = rhsBase + j;
+        int out_slot = outBase + j;
+
+        for (int b : banks) emitAAP(SLOT_T0_T1_T2,  SLOT_DCC1,      b);
+        for (int b : banks) emitAAP(SLOT_T2_T3,     lhs_slot,        b);
+        for (int b : banks) emitAAP(SLOT_DCC1,      rhs_slot,        b);
+        for (int b : banks) emitAP (SLOT_DCC1_T0_T3,                  b);
+        for (int b : banks) emitAAP(SLOT_T0_T3,     SLOT_DCC1N,      b);
+        for (int b : banks) emitAP (SLOT_T0_T1_T2,                    b);
+        for (int b : banks) emitAAP(SLOT_T1,        rhs_slot,         b);
+        for (int b : banks) emitAAP(out_slot,       SLOT_T1_T2_T3,   b);
+    }
+
+    // The extra result row: store the surviving carry-out.
+    for (int b : banks) emitAAP(outBase + bw, SLOT_DCC1, b);
+}
+
+// ---------------------------------------------------------------------------
+// Bit-serial ReLU (predicated zero): out[i] = lhs[i] AND ~sign(lhs).
+//
+// For a two's-complement value the sign bit is the top data row, so ReLU needs
+// no comparator and no multiplexer: invert that one row once, then AND it into
+// every bit row.  Cost is exactly 2 + 4*bw AAP -- 2 for the inversion through
+// the dual-contact cell (write DCC1, read its negated output DCC1N) and 4 per
+// bit for execute_row_and.  This matches getComputeLatency()'s 4*bw + 2 in the
+// Cinnamon scheduler exactly, which is the invariant the whole comparison
+// rests on.
+// ---------------------------------------------------------------------------
+void
+RowOpTracePlayer::expandRelu(int bw, const std::vector<int>& banks)
+{
+    if (backend == BK_PRADA) { expandReluPrada(bw, banks); return; }
+    if (backend != BK_SIMDRAM)
+        panic("RowOpTracePlayer: OP_RELU is not implemented for the fcdram "
+              "backend; its cross-subarray AND/NOT operand staging differs "
+              "and has not been validated for this op");
+
+    // mask = ~sign, via the dual-contact cell.
+    for (int b : banks) emitAAP(SLOT_DCC1, lhsBase + bw - 1, b); // DCC1 = sign
+    for (int b : banks) emitAAP(SLOT_T3,   SLOT_DCC1N,       b); // T3 = ~sign
+
+    // out[i] = lhs[i] AND mask.  emitRowAnd uses T0/T1/T2 only, so the mask
+    // parked in T3 survives every iteration.
+    for (int i = 0; i < bw; i++)
+        emitRowAnd(lhsBase + i, SLOT_T3, outBase + i, banks);
+}
+
+// ---------------------------------------------------------------------------
+// XNOR: the binary-neural-network multiply.  With +/-1 encoded in one bit
+// (0 -> -1, 1 -> +1), multiplying two binary values IS the equality predicate,
+// so a whole K-element binary dot product becomes one XNOR plus a popcount.
+//
+// XNOR(a,b) = (a OR ~b) AND (~a OR b) -- three majority gates.  Each dual
+// contact cell supplies an operand and its complement simultaneously, so both
+// OR terms are computed in place with a bare AP and no extra copies:
+//
+//   1. AAP(DCC0N_T0, lhs[i])  DCC0N = a, T0 = a   =>  DCC0 reads ~a
+//   2. AAP(DCC1N_T1, rhs[i])  DCC1N = b, T1 = b   =>  DCC1 reads ~b
+//   3. AAP(T2_T3,    C_1)     T2 = T3 = 1
+//   4. AP (DCC0_T1_T2)        maj(~a, b, 1) = ~a|b  -> DCC0, T1, T2
+//   5. AP (DCC1_T0_T3)        maj(~b, a, 1) =  a|~b -> DCC1, T0, T3
+//   6. AAP(T2,       C_0)     T2 = 0   (~a|b survives in T1)
+//   7. AAP(out[i],   T0_T1_T2) maj(a|~b, ~a|b, 0) = XNOR
+//
+// Step 5 reads only rows step 4 did not touch (it writes DCC0/T1/T2, step 5
+// reads DCC1/T0/T3), and step 7 reads T0 from step 5, T1 from step 4 and T2
+// from step 6 -- no step clobbers a row a later step still needs, and nothing
+// is carried between bit positions, so the loop is safe at any width.
+//
+// Cost is exactly 7 commands per bit, counting AAP and AP alike -- the same
+// convention expandAddSimdram is priced under (6 AAP + 2 AP per bit = 8n+1).
+// This matches getComputeLatency()'s 7*n in the Cinnamon scheduler exactly,
+// which is the invariant the whole comparison rests on.
+//
+// XOR would be this identical sequence with C_0 and C_1 swapped in steps 3
+// and 6 (two ANDs combined by an OR instead of the reverse); it is not
+// emitted today, so it has no record kind.
+// ---------------------------------------------------------------------------
+void
+RowOpTracePlayer::expandXnor(int bw, const std::vector<int>& banks)
+{
+    if (backend == BK_PRADA) { expandXnorPrada(bw, banks); return; }
+    if (backend != BK_SIMDRAM)
+        panic("RowOpTracePlayer: OP_XNOR is not implemented for the fcdram "
+              "backend; its cross-subarray majority-gate operand staging "
+              "differs and has not been validated for this op");
+
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitAAP(SLOT_DCC0N_T0, lhsBase + i,   b);
+        for (int b : banks) emitAAP(SLOT_DCC1N_T1, rhsBase + i,   b);
+        for (int b : banks) emitAAP(SLOT_T2_T3,    SLOT_C_1,      b);
+        for (int b : banks) emitAP (SLOT_DCC0_T1_T2,              b);
+        for (int b : banks) emitAP (SLOT_DCC1_T0_T3,              b);
+        for (int b : banks) emitAAP(SLOT_T2,       SLOT_C_0,      b);
+        for (int b : banks) emitAAP(outBase + i,   SLOT_T0_T1_T2, b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BitWeaving/V BETWEEN range scan: lower < value < upper over a bw-bit
+// bit-sliced column, producing one mask row.  Models 90_bitweave-plus.c.
+//
+// Two comparison chains advance together, one majority gate each, via the
+// single-bit recurrence (LSB to MSB, R = ">= lower", S = "<= upper"):
+//
+//   lower[j]==0 -> R = R OR  v[j]     upper[j]==1 -> S = S OR  ~v[j]
+//   lower[j]==1 -> R = R AND v[j]     upper[j]==0 -> S = S AND ~v[j]
+//
+// MAJ3(sel, v, acc) is OR when sel==1 and AND when sel==0, so one AP per
+// chain advances it; the dual-contact cell hands back ~v for free.  Per bit:
+//
+//   1. AAP(DCC0N_T0, col[j])   load v      => DCC0 reads ~v
+//   2. AAP(<sel rows>, C_0|C_1) the ONLY branch-dependent command
+//   3. AP (DCC1_T0_T3)         advance R
+//   4. AP (DCC0_T1_T2)         advance S
+//
+// Each accumulator is held redundantly in three rows; step 2 clobbers a
+// different pair depending on the branch, always leaving one live copy, and
+// the APs broadcast the majority back into all three.  Which rows hold the
+// selector and which hold the accumulator therefore SWAP between branches --
+// that is what lets one AP serve both OR and AND.
+//
+// Cost is 4 commands per bit regardless of branch: all four cases emit one
+// AAP for the selector, differing only in which constant row is read and
+// which group is written.  The scanned constants therefore do not affect
+// timing, which is why the compiler prices this from the bit width alone and
+// why emitting one representative branch here is exact.  Total 4*bw + 5,
+// matching getComputeLatency()'s 4n + 5.
+//
+// NOTE vs the reference: 90_bitweave-plus.c seeds only DCC1 and T0/T1/T2, and
+// reads T3 as an accumulator on its first iteration when lower[0]==upper[0] --
+// T3 is never initialised there.  It is a pure timing microbenchmark whose
+// result is never checked, so that gap does not affect its numbers, but the
+// sequence as written is not correct.  The extra AAP(T3, C_1) below closes it
+// for one command, which is why this is 4n+5 and not the reference's 4n+4.
+//
+// No early termination, matching all three reference implementations (they
+// scan every bit plane unconditionally).  Real BitWeaving/V can stop once
+// every value is resolved, which is data dependent and cannot be expressed in
+// a static trace -- so this is an upper bound on the scan cost.
+// ---------------------------------------------------------------------------
+void
+RowOpTracePlayer::expandRangeScan(int bw, const std::vector<int>& banks)
+{
+    if (backend == BK_PRADA) { expandRangeScanPrada(bw, banks); return; }
+    if (backend != BK_SIMDRAM)
+        panic("RowOpTracePlayer: OP_RANGE_SCAN is not implemented for the "
+              "fcdram backend; its cross-subarray majority-gate operand "
+              "staging differs and has not been validated for this op");
+
+    // Seed both chains to 1 (inclusive BETWEEN): R in DCC1, S in T2.
+    for (int b : banks) emitAAP(SLOT_DCC1,     SLOT_C_1, b);
+    for (int b : banks) emitAAP(SLOT_T0_T1_T2, SLOT_C_1, b);
+    for (int b : banks) emitAAP(SLOT_T3,       SLOT_C_1, b);
+
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitAAP(SLOT_DCC0N_T0, lhsBase + i, b);
+        for (int b : banks) emitAAP(SLOT_DCC1N_T1, SLOT_C_0,    b);
+        for (int b : banks) emitAP (SLOT_DCC1_T0_T3,            b);
+        for (int b : banks) emitAP (SLOT_DCC0_T1_T2,            b);
+    }
+
+    // mask = R AND S = maj(0, T2, T3).
+    for (int b : banks) emitAAP(SLOT_T1,     SLOT_C_0,      b);
+    for (int b : banks) emitAAP(outBase + 0, SLOT_T1_T2_T3, b);
+}
+
+// ---------------------------------------------------------------------------
+// Bit-serial min/max: compare, then select.  The two differ only in which
+// operand each mux branch takes, so one implementation serves both.
+//
+// Phase 1 -- compare, G = (a > b), LSB to MSB.  The whole comparator is ONE
+// majority gate per bit:
+//
+//     G_new = MAJ3(a[j], ~b[j], G_prev)
+//
+//   a=0,b=0 -> maj(0,1,G) = G   (equal, carry the lower-bit verdict)
+//   a=1,b=1 -> maj(1,0,G) = G   (equal, carry)
+//   a=1,b=0 -> maj(1,1,G) = 1   (a > b)
+//   a=0,b=1 -> maj(0,0,G) = 0   (a < b)
+//
+// G is parked in T3 and survives each round: the next iteration's AAPs
+// clobber T0 (G still in DCC1 and T3) and DCC1 (G still in T3).  3 per bit.
+//
+// Phase 2 -- select.  mux(G,x,y) = (G AND x) OR (~G AND y)
+//                               = MAJ(MAJ(G,x,0), MAJ(~G,y,0), 1),
+// three majority gates, 10 commands per bit.  G is first parked in DCC0 so
+// that both G and ~G are readable for free while T0..T3 are reused as scratch.
+//
+//   max = mux(G, a, b)   min = mux(G, b, a)
+//
+// Total 13*bw + 2, matching getComputeLatency()'s 13n + 2.
+//
+// Not a fused compare-exchange: sharing one comparison between a min and a
+// max would save 3*bw of 26*bw (12%) at the cost of a two-result op, which is
+// not worth it for a component that is a third of the KNN kernel.
+// ---------------------------------------------------------------------------
+void
+RowOpTracePlayer::expandMinMax(int bw, const std::vector<int>& banks,
+                               bool isMax)
+{
+    if (backend == BK_PRADA) { expandMinMaxPrada(bw, banks, isMax); return; }
+    if (backend != BK_SIMDRAM)
+        panic("RowOpTracePlayer: OP_MIN/OP_MAX are not implemented for the "
+              "fcdram backend; its cross-subarray majority-gate operand "
+              "staging differs and has not been validated for these ops");
+
+    // --- Phase 1: G = (a > b), seeded false so that equal operands select b.
+    for (int b : banks) emitAAP(SLOT_T3, SLOT_C_0, b);
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitAAP(SLOT_T0,       lhsBase + i, b);
+        for (int b : banks) emitAAP(SLOT_DCC1N_T1, rhsBase + i, b);
+        for (int b : banks) emitAP (SLOT_DCC1_T0_T3,            b);
+    }
+
+    // Park the verdict where its complement is free.
+    for (int b : banks) emitAAP(SLOT_DCC0, SLOT_T3, b);
+
+    // --- Phase 2: out[i] = mux(G, x[i], y[i]).
+    const int xBase = isMax ? lhsBase : rhsBase;
+    const int yBase = isMax ? rhsBase : lhsBase;
+    for (int i = 0; i < bw; i++) {
+        for (int b : banks) emitAAP(SLOT_T1,     SLOT_DCC0,     b); // T1 = G
+        for (int b : banks) emitAAP(SLOT_T0,     xBase + i,     b);
+        for (int b : banks) emitAAP(SLOT_T2,     SLOT_C_0,      b);
+        for (int b : banks) emitAAP(SLOT_T3,     SLOT_T0_T1_T2, b); // T3 = G&x
+        for (int b : banks) emitAAP(SLOT_T1,     SLOT_DCC0N,    b); // T1 = ~G
+        for (int b : banks) emitAAP(SLOT_T0,     yBase + i,     b);
+        for (int b : banks) emitAAP(SLOT_T2,     SLOT_C_0,      b);
+        for (int b : banks) emitAP (SLOT_T0_T1_T2,              b); // = ~G&y
+        for (int b : banks) emitAAP(SLOT_T2,     SLOT_C_1,      b);
+        for (int b : banks) emitAAP(outBase + i, SLOT_T1_T2_T3, b);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // execute_row_copy_batch (single task: src_bank -> dst_bank for bw slots)
 //
@@ -891,6 +1453,28 @@ RowOpTracePlayer::loadTrace()
             max_lhs = std::max(max_lhs, nr.lhs_bw);
             max_rhs = std::max(max_rhs, nr.rhs_bw);
             max_out = std::max(max_out, std::min(nr.lhs_bw, nr.rhs_bw));
+        } else if (nr.kind == OP_SUBI) { // N - N -> N, like OP_ADDI
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_rhs = std::max(max_rhs, nr.rhs_bw);
+            max_out = std::max(max_out, std::min(nr.lhs_bw, nr.rhs_bw));
+        } else if (nr.kind == OP_ADDI_WIDE) { // N + N -> N+1 (carry-out row)
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_rhs = std::max(max_rhs, nr.rhs_bw);
+            max_out = std::max(max_out, std::max(nr.lhs_bw, nr.rhs_bw) + 1);
+        } else if (nr.kind == OP_RELU) { // unary: lhs[] -> out[]
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_out = std::max(max_out, nr.lhs_bw);
+        } else if (nr.kind == OP_XNOR) { // N x N -> N, elementwise
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_rhs = std::max(max_rhs, nr.rhs_bw);
+            max_out = std::max(max_out, nr.lhs_bw);
+        } else if (nr.kind == OP_RANGE_SCAN) { // L bit planes -> 1 mask row
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_out = std::max(max_out, 1);
+        } else if (nr.kind == OP_MIN || nr.kind == OP_MAX) { // N x N -> N
+            max_lhs = std::max(max_lhs, nr.lhs_bw);
+            max_rhs = std::max(max_rhs, nr.rhs_bw);
+            max_out = std::max(max_out, nr.lhs_bw);
         } else { // ROW_COPY: src=out[], dst=lhs[]
             max_lhs = std::max(max_lhs, nr.lhs_bw);
             max_out = std::max(max_out, nr.lhs_bw);
@@ -966,6 +1550,27 @@ RowOpTracePlayer::loadTrace()
             break;
           case OP_ROW_COPY:
             expandRowCopy(r.lhs_bw, r.src, r.dst);
+            break;
+          case OP_RELU:
+            expandRelu(r.lhs_bw, compBanks);
+            break;
+          case OP_SUBI:
+            expandSub(r.lhs_bw, r.rhs_bw, compBanks);
+            break;
+          case OP_ADDI_WIDE:
+            expandAddWide(r.lhs_bw, compBanks);
+            break;
+          case OP_XNOR:
+            expandXnor(r.lhs_bw, compBanks);
+            break;
+          case OP_RANGE_SCAN:
+            expandRangeScan(r.lhs_bw, compBanks);
+            break;
+          case OP_MIN:
+            expandMinMax(r.lhs_bw, compBanks, /*isMax=*/false);
+            break;
+          case OP_MAX:
+            expandMinMax(r.lhs_bw, compBanks, /*isMax=*/true);
             break;
           default:
             panic("RowOpTracePlayer: unknown op kind %u at record %llu",

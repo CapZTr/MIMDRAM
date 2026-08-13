@@ -5,6 +5,7 @@
 *.patch
 *.pyc
 *.done
+*.zst
 *parsetab.py
 */build/
 */m5out/

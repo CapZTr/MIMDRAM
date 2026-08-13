@@ -226,12 +226,35 @@ class RowOpTracePlayer : public MemObject
 
     // Backend-dispatching expanders: pick the per-backend implementation.
     void expandAdd(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
+    void expandSub(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
     void expandMul(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
     // ROW_COPY (inter-bank bus copy) is backend-independent — shared verbatim.
     void expandRowCopy(int bw, int src_bank, int dst_bank);
+    // The five ops below are implemented for simdram and prada.  fcdram
+    // panics: its gates are cross-subarray with open-bitline half-row
+    // coverage and a destructive MAJ3, so every one of these sequences would
+    // need its own reference-row re-initialisation analysis, and guessing it
+    // would break the exact compiler/simulator op-count agreement the whole
+    // evaluation rests on.
+    //
+    // Bit-serial ReLU: out[i] = lhs[i] AND ~sign, for every bit row i.
+    void expandRelu(int bw, const std::vector<int>& banks);
+    // Widening add: N-bit + N-bit -> (N+1)-bit, keeping the carry-out row.
+    void expandAddWide(int bw, const std::vector<int>& banks);
+
+    // Bitwise XNOR, the binary-neural-network multiply.
+    void expandXnor(int bw, const std::vector<int>& banks);
+
+    // BitWeaving/V BETWEEN range scan over a bw-bit bit-sliced column.
+    void expandRangeScan(int bw, const std::vector<int>& banks);
+
+    // Bit-serial min/max (compare then select).  One implementation serves
+    // both -- they differ only in which operand each mux branch selects.
+    void expandMinMax(int bw, const std::vector<int>& banks, bool isMax);
 
     // --- SIMDRAM backend (Ambit AAP/AP) ------------------------------- //
     void expandAddSimdram(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
+    void expandSubSimdram(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
     void expandMulSimdram(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
 
     // Ambit primitive emitters
@@ -290,6 +313,16 @@ class RowOpTracePlayer : public MemObject
     // primitive is needed -- these ops already exist with faithful timing.
     void expandAddPrada(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
     void expandMulPrada(int lhs_bw, int rhs_bw, const std::vector<int>& banks);
+    void expandSubPrada     (int lhs_bw, int rhs_bw,
+                             const std::vector<int>& banks);
+    void expandAddWidePrada (int bw, const std::vector<int>& banks);
+    void expandReluPrada    (int bw, const std::vector<int>& banks);
+    void expandXnorPrada    (int bw, const std::vector<int>& banks);
+    void expandRangeScanPrada(int bw, const std::vector<int>& banks);
+    void expandMinMaxPrada  (int bw, const std::vector<int>& banks, bool isMax);
+    // PRADA OR: out = MAJ(1, lhs, rhs), the dual of emitRowAndPrada.
+    void emitRowOrPrada(int lhs_slot, int rhs_slot, int out_slot,
+                        const std::vector<int>& banks);
 
     // PRADA primitive emitters (per single bank).  ROWAAAP = A A As P (a
     // 3-activation sequence: TRA majority OR a two-destination copy -- same
